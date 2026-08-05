@@ -149,15 +149,6 @@ struct PairingView: View {
     private func connectTo(_ peripheralID: UUID) {
         pairingStatus = .connecting
         appState.coordinator.connect(to: peripheralID)
-
-        // The coordinator sends the pairing request itself once BLE
-        // characteristics are ready — sending on raw connect would race
-        // service discovery and be dropped.
-        appState.coordinator.onConnectionChanged = { connected in
-            if connected {
-                pairingStatus = .exchangingKeys
-            }
-        }
     }
 
     private func handlePairingData(_ jsonString: String) {

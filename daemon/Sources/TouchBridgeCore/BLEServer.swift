@@ -92,6 +92,8 @@ public class BLEServer: NSObject, BLEServerInterface {
 
     private var peripheralManager: CBPeripheralManager!
     private var service: CBMutableService?
+    private var isServiceRegistered = false
+    private var wantsAdvertising = false
 
     // Characteristics
     private var sessionKeyChar: CBMutableCharacteristic?
@@ -130,8 +132,13 @@ public class BLEServer: NSObject, BLEServerInterface {
 
     /// Start advertising the TouchBridge BLE service.
     public func startAdvertising() {
-        guard isReady, !isAdvertising else {
-            logger.warning("Cannot start advertising: ready=\(self.isReady), advertising=\(self.isAdvertising)")
+        wantsAdvertising = true
+        startAdvertisingIfReady()
+    }
+
+    private func startAdvertisingIfReady() {
+        guard isReady, isServiceRegistered, !isAdvertising else {
+            logger.info("Deferring advertising: ready=\(self.isReady), serviceRegistered=\(self.isServiceRegistered), advertising=\(self.isAdvertising)")
             return
         }
 
@@ -145,6 +152,7 @@ public class BLEServer: NSObject, BLEServerInterface {
 
     /// Stop advertising.
     public func stopAdvertising() {
+        wantsAdvertising = false
         guard isAdvertising else { return }
         peripheralManager.stopAdvertising()
         isAdvertising = false
@@ -291,6 +299,7 @@ extension BLEServer: CBPeripheralManagerDelegate {
             logger.warning("Bluetooth powered off")
             isReady = false
             isAdvertising = false
+            isServiceRegistered = false
         case .unauthorized:
             logger.error("Bluetooth unauthorized — check Info.plist NSBluetoothAlwaysUsageDescription")
             isReady = false
@@ -312,6 +321,10 @@ extension BLEServer: CBPeripheralManagerDelegate {
             logger.error("Failed to add service: \(error.localizedDescription)")
         } else {
             logger.info("Service added successfully")
+            isServiceRegistered = true
+            if wantsAdvertising {
+                startAdvertisingIfReady()
+            }
         }
     }
 

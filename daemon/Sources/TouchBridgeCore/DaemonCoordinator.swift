@@ -258,6 +258,14 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
             sessions.filter { $0.value.sessionCrypto != nil }.map(\.key)
         }
     }
+
+    /// Get all connected centrals that are both encrypted and recognised as a
+    /// previously paired device, so they can receive challenges.
+    public var identifiedCentrals: [UUID] {
+        stateLock.withLock {
+            sessions.filter { $0.value.sessionCrypto != nil && $0.value.deviceID != nil }.map(\.key)
+        }
+    }
 }
 
 // MARK: - BLEServerDelegate

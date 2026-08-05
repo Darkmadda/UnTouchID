@@ -27,13 +27,20 @@ struct PairCommand: ParsableCommand {
 
     func run() throws {
         let keychainStore = KeychainStore()
-        let pairingManager = PairingManager(keychainStore: keychainStore)
+        // Pair against the same persistent, per-Mac UUID used by the
+        // long-running daemon. Using the protocol's shared default here makes
+        // a successful one-off pairing unable to reconnect to `serve` later.
+        let config = DaemonConfig.load()
+        let pairingManager = PairingManager(
+            keychainStore: keychainStore,
+            serviceUUID: config.serviceUUID
+        )
         let coordinator = DaemonCoordinator(
             keychainStore: keychainStore,
-            pairingManager: pairingManager
+            pairingManager: pairingManager,
+            serviceUUID: config.serviceUUID
         )
 
-        let semaphore = DispatchSemaphore(value: 0)
         var paired = false
 
         // Generate and display QR data
@@ -80,7 +87,6 @@ struct PairCommand: ParsableCommand {
             print("  Paired: \(device.pairedAt)")
             print("")
             paired = true
-            semaphore.signal()
         }
 
         // Start BLE advertising
@@ -90,21 +96,17 @@ struct PairCommand: ParsableCommand {
             print("Waiting for companion device to connect (timeout: \(self.timeout)s)...")
         }
 
-        // Wait with timeout
-        DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(timeout)) {
-            if !paired {
-                print("\nPairing timed out after \(self.timeout) seconds.")
-                semaphore.signal()
-            }
+        // Keep the main run loop alive. CoreBluetooth and the delayed advertising
+        // callback both use the main queue; blocking it with a semaphore prevents
+        // advertising from ever starting.
+        let deadline = Date(timeIntervalSinceNow: TimeInterval(timeout))
+        while !paired && Date() < deadline {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
         }
 
-        // Run the run loop on a background thread to handle BLE callbacks
-        let thread = Thread {
-            RunLoop.current.run(until: Date(timeIntervalSinceNow: TimeInterval(self.timeout)))
+        if !paired {
+            print("\nPairing timed out after \(self.timeout) seconds.")
         }
-        thread.start()
-
-        semaphore.wait()
         coordinator.stop()
 
         // The QR image contains the (now spent or expired) pairing token — remove it.
@@ -173,13 +175,15 @@ struct ChallengeCommand: ParsableCommand {
             throw ExitCode.failure
         }
 
-        let coordinator = DaemonCoordinator(keychainStore: keychainStore)
-        let semaphore = DispatchSemaphore(value: 0)
+        let config = DaemonConfig.load()
+        let coordinator = DaemonCoordinator(
+            keychainStore: keychainStore,
+            serviceUUID: config.serviceUUID
+        )
         var challengeResult: ChallengeResult?
 
         coordinator.onChallengeResult = { _, result, _ in
             challengeResult = result
-            semaphore.signal()
         }
 
         coordinator.start()
@@ -195,17 +199,12 @@ struct ChallengeCommand: ParsableCommand {
         var centralID: UUID?
         let pollDeadline = Date(timeIntervalSinceNow: TimeInterval(timeout))
 
-        let thread = Thread {
-            RunLoop.current.run(until: pollDeadline)
-        }
-        thread.start()
-
         while Date() < pollDeadline {
-            if let first = coordinator.readyCentrals.first {
+            if let first = coordinator.identifiedCentrals.first {
                 centralID = first
                 break
             }
-            Thread.sleep(forTimeInterval: 0.5)
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
         }
 
         guard let central = centralID else {
@@ -218,30 +217,34 @@ struct ChallengeCommand: ParsableCommand {
         print("Companion connected. Issuing challenge...")
 
         // Issue the challenge
-        let group = DispatchGroup()
-        group.enter()
+        var challengeIssued = false
+        var issueFinished = false
+        let issueDeadline = Date(timeIntervalSinceNow: TimeInterval(timeout))
         Task {
-            let issued = await coordinator.issueChallenge(to: central, reason: reason)
-            if issued == nil {
-                print("Failed to issue challenge.")
-                semaphore.signal()
-            }
-            group.leave()
+            challengeIssued = await coordinator.issueChallenge(to: central, reason: reason) != nil
+            issueFinished = true
         }
-        group.wait()
 
-        // Wait for response
-        let waitResult = semaphore.wait(timeout: .now() + .seconds(timeout))
-
-        coordinator.stop()
-
-        if waitResult == .timedOut {
-            print("\nFAILED_TIMEOUT: Companion did not respond within \(timeout) seconds.")
+        while !issueFinished && Date() < issueDeadline {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+        }
+        guard challengeIssued else {
+            print("Failed to issue challenge.")
+            coordinator.stop()
             throw ExitCode.failure
         }
 
+        // Keep the main run loop active so CoreBluetooth can deliver the signed
+        // response from the companion instead of blocking it on a semaphore.
+        let responseDeadline = Date(timeIntervalSinceNow: TimeInterval(timeout))
+        while challengeResult == nil && Date() < responseDeadline {
+            RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.1))
+        }
+
+        coordinator.stop()
+
         guard let result = challengeResult else {
-            print("\nFAILED: No result received.")
+            print("\nFAILED_TIMEOUT: Companion did not respond within \(timeout) seconds.")
             throw ExitCode.failure
         }
 

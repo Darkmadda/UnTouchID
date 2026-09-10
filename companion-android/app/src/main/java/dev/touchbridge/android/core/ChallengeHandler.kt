@@ -3,193 +3,124 @@ package dev.touchbridge.android.core
 import android.util.Log
 import dev.touchbridge.android.Constants
 import org.json.JSONObject
-import java.security.KeyFactory
-import java.security.KeyPairGenerator
-import java.security.spec.ECGenParameterSpec
-import javax.crypto.Cipher
-import javax.crypto.KeyAgreement
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
 /**
- * Handles the challenge-response flow on the Android side.
+ * Wire-format codec for the challenge/response flow, plus the per-Mac
+ * [SecureSession] registry it encrypts with.
  *
- * Equivalent to iOS ChallengeHandler:
- * 1. Receive encrypted challenge from Mac
- * 2. Decrypt with ECDH session key
+ * Flow per Mac:
+ * 1. Receive encrypted challenge from that Mac
+ * 2. Decrypt with that Mac's ECDH session key
  * 3. Prompt biometric via BiometricPrompt
- * 4. Sign nonce with Android Keystore key
- * 5. Send signed response back via BLE
- *
- * The ECDH session and AES-GCM encryption use standard JCA/JCE APIs,
- * producing output compatible with Apple's CryptoKit (same algorithms).
+ * 4. Sign nonce with the (single, shared) Android Keystore key
+ * 5. Send the signed response back over that Mac's BLE link
  */
-class ChallengeHandler(
-    private val keystoreManager: KeystoreManager,
-    private val bleClient: BLEClient,
-) {
+class ChallengeHandler {
     companion object {
         private const val TAG = "ChallengeHandler"
     }
 
-    // ECDH session state
-    private var sessionKey: SecretKeySpec? = null
-    private var localECDHPrivateKey: java.security.PrivateKey? = null
+    private val sessions = HashMap<String, SecureSession>()
 
-    /**
-     * Perform ECDH key exchange — generate ephemeral key pair and send public key to Mac.
-     */
-    fun initiateECDH(): ByteArray {
-        val keyPairGen = KeyPairGenerator.getInstance("EC")
-        keyPairGen.initialize(ECGenParameterSpec("secp256r1"))
-        val keyPair = keyPairGen.generateKeyPair()
-
-        localECDHPrivateKey = keyPair.private
-
-        // Export public key in X9.62 uncompressed format
-        val encoded = keyPair.public.encoded
-        val publicKeyBytes = if (encoded.size > 65) encoded.takeLast(65).toByteArray() else encoded
-
-        Log.i(TAG, "Generated ECDH ephemeral key pair (${publicKeyBytes.size} bytes)")
-        return publicKeyBytes
+    private fun session(macId: String): SecureSession = synchronized(sessions) {
+        sessions.getOrPut(macId) { SecureSession(macId.takeLast(4)) }
     }
 
-    /**
-     * Complete ECDH — derive shared secret from Mac's public key.
-     */
-    fun completeECDH(macPublicKeyBytes: ByteArray) {
-        val privKey = localECDHPrivateKey ?: throw IllegalStateException("ECDH not initiated")
+    fun isSessionReady(macId: String): Boolean =
+        synchronized(sessions) { sessions[macId]?.isReady == true }
 
-        // Reconstruct Mac's public key from X9.62 bytes
-        // Build X.509 SubjectPublicKeyInfo wrapper for EC P-256
-        val header = byteArrayOf(
-            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86.toByte(),
-            0x48, 0xCE.toByte(), 0x3D, 0x02, 0x01, 0x06, 0x08, 0x2A,
-            0x86.toByte(), 0x48, 0xCE.toByte(), 0x3D, 0x03, 0x01, 0x07,
-            0x03, 0x42, 0x00
-        )
-        val x509Encoded = header + macPublicKeyBytes
-
-        val keyFactory = KeyFactory.getInstance("EC")
-        val macPublicKey = keyFactory.generatePublic(
-            java.security.spec.X509EncodedKeySpec(x509Encoded)
-        )
-
-        // ECDH key agreement
-        val keyAgreement = KeyAgreement.getInstance("ECDH")
-        keyAgreement.init(privKey)
-        keyAgreement.doPhase(macPublicKey, true)
-        val sharedSecret = keyAgreement.generateSecret()
-
-        // HKDF-SHA256 to derive AES-256 key (matching Apple's CryptoKit derivation)
-        val derivedKey = hkdfSHA256(
-            ikm = sharedSecret,
-            salt = byteArrayOf(),
-            info = "TouchBridge-v1".toByteArray(),
-            length = 32
-        )
-
-        sessionKey = SecretKeySpec(derivedKey, "AES")
-        Log.i(TAG, "ECDH session established")
+    /** Drop a Mac's session (on disconnect or unpair) so stale keys are never reused. */
+    fun clearSession(macId: String) {
+        synchronized(sessions) { sessions.remove(macId) }
     }
 
-    /**
-     * Decrypt data with the session key (AES-256-GCM).
-     */
-    fun decrypt(ciphertext: ByteArray): ByteArray {
-        val key = sessionKey ?: throw IllegalStateException("No session key")
+    fun initiateECDH(macId: String): ByteArray = session(macId).initiateECDH()
 
-        // AES-GCM format: nonce (12 bytes) + ciphertext + tag (16 bytes)
-        val nonce = ciphertext.copyOfRange(0, 12)
-        val encrypted = ciphertext.copyOfRange(12, ciphertext.size)
+    fun completeECDH(macId: String, macPublicKeyBytes: ByteArray) =
+        session(macId).completeECDH(macPublicKeyBytes)
 
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, nonce))
-        return cipher.doFinal(encrypted)
-    }
+    fun encrypt(macId: String, plaintext: ByteArray): ByteArray = session(macId).encrypt(plaintext)
 
     /**
-     * Encrypt data with the session key (AES-256-GCM).
+     * Parse an incoming challenge wire frame from [macId] and decrypt its nonce.
+     *
+     * Wire format: [version=1][type=3(challengeIssued)] + plain JSON — only the
+     * `encryptedNonce` field is AES-GCM encrypted with that Mac's session key.
+     *
+     * Returns null if the frame is malformed, the session isn't established,
+     * or the challenge has already expired.
      */
-    fun encrypt(plaintext: ByteArray): ByteArray {
-        val key = sessionKey ?: throw IllegalStateException("No session key")
+    fun parseChallengeWire(macId: String, macName: String, data: ByteArray): PendingChallenge? {
+        val session = synchronized(sessions) { sessions[macId] }
+        if (session == null || !session.isReady) {
+            Log.w(TAG, "Challenge from $macName received before ECDH session established")
+            return null
+        }
+        if (data.size <= 2) return null
 
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key)
-
-        val nonce = cipher.iv // 12 bytes, auto-generated
-        val encrypted = cipher.doFinal(plaintext)
-
-        // Return: nonce + ciphertext+tag (matching CryptoKit's combined format)
-        return nonce + encrypted
-    }
-
-    /**
-     * Parse a challenge message from decrypted JSON payload.
-     */
-    fun parseChallenge(payload: ByteArray): ChallengeData {
-        val json = JSONObject(String(payload))
-        return ChallengeData(
-            challengeID = json.getString("challengeID"),
-            encryptedNonce = android.util.Base64.decode(
+        return try {
+            val json = JSONObject(String(data.copyOfRange(2, data.size)))
+            val encryptedNonce = android.util.Base64.decode(
                 json.getString("encryptedNonce"), android.util.Base64.DEFAULT
-            ),
-            reason = json.getString("reason"),
-            expiryUnix = json.getLong("expiryUnix")
-        )
+            )
+            val expiryUnix = json.getLong("expiryUnix")
+            if (System.currentTimeMillis() / 1000 >= expiryUnix) {
+                Log.w(TAG, "Challenge expired before handling")
+                return null
+            }
+            PendingChallenge(
+                macId = macId,
+                macName = macName,
+                challengeID = json.getString("challengeID"),
+                nonce = session.decrypt(encryptedNonce),
+                reason = json.getString("reason"),
+                expiryUnix = expiryUnix,
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse challenge", e)
+            null
+        }
     }
 
     /**
-     * Build the signed response JSON.
+     * Build the signed response wire frame.
+     * Wire format: [version=1][type=4(challengeResponse)] + plain JSON.
      */
-    fun buildResponse(challengeID: String, signature: ByteArray, deviceID: String): ByteArray {
+    fun buildResponseWire(challengeID: String, signature: ByteArray, deviceID: String): ByteArray {
         val json = JSONObject().apply {
             put("challengeID", challengeID)
             put("signature", android.util.Base64.encodeToString(signature, android.util.Base64.NO_WRAP))
             put("deviceID", deviceID)
         }
-        return json.toString().toByteArray()
+        return byteArrayOf(Constants.PROTOCOL_VERSION, Constants.MSG_TYPE_CHALLENGE_RESPONSE) +
+            json.toString().toByteArray()
     }
 
-    val isSessionReady: Boolean get() = sessionKey != null
-
     /**
-     * HKDF-SHA256 key derivation (RFC 5869).
-     * Must match Apple CryptoKit's HKDF implementation for interoperability.
+     * Build a key-invalidated error frame so the Mac fails fast instead of
+     * waiting for the response timeout.
+     * Wire format: [version=1][type=5(error)] + AES-GCM encrypted JSON.
      */
-    private fun hkdfSHA256(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int): ByteArray {
-        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
-
-        // Extract
-        val actualSalt = if (salt.isEmpty()) ByteArray(32) else salt
-        mac.init(SecretKeySpec(actualSalt, "HmacSHA256"))
-        val prk = mac.doFinal(ikm)
-
-        // Expand
-        mac.init(SecretKeySpec(prk, "HmacSHA256"))
-        val result = ByteArray(length)
-        var t = byteArrayOf()
-        var offset = 0
-        var counter: Byte = 1
-
-        while (offset < length) {
-            mac.update(t)
-            mac.update(info)
-            mac.update(counter)
-            t = mac.doFinal()
-            val toCopy = minOf(t.size, length - offset)
-            System.arraycopy(t, 0, result, offset, toCopy)
-            offset += toCopy
-            counter++
-        }
-
-        return result
+    fun buildKeyInvalidatedErrorWire(macId: String, challengeID: String): ByteArray {
+        val payload = JSONObject().apply {
+            put("code", Constants.ERROR_CODE_KEY_INVALIDATED)
+            put("description", "key_invalidated")
+            put("challengeID", challengeID)
+        }.toString().toByteArray()
+        return byteArrayOf(Constants.PROTOCOL_VERSION, Constants.MSG_TYPE_ERROR) + encrypt(macId, payload)
     }
 }
 
-data class ChallengeData(
+/** A decrypted challenge from one Mac awaiting biometric approval. */
+data class PendingChallenge(
+    val macId: String,
+    val macName: String,
     val challengeID: String,
-    val encryptedNonce: ByteArray,
+    val nonce: ByteArray,
     val reason: String,
-    val expiryUnix: Long
-)
+    val expiryUnix: Long,
+) {
+    override fun equals(other: Any?): Boolean =
+        other is PendingChallenge && challengeID == other.challengeID
+    override fun hashCode(): Int = challengeID.hashCode()
+}

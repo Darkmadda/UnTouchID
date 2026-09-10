@@ -92,8 +92,6 @@ public class BLEServer: NSObject, BLEServerInterface {
 
     private var peripheralManager: CBPeripheralManager!
     private var service: CBMutableService?
-    private var isServiceRegistered = false
-    private var wantsAdvertising = false
 
     // Characteristics
     private var sessionKeyChar: CBMutableCharacteristic?
@@ -118,6 +116,11 @@ public class BLEServer: NSObject, BLEServerInterface {
     /// Whether we are currently advertising.
     public private(set) var isAdvertising: Bool = false
 
+    /// Set when advertising is requested before Bluetooth is powered on, so we
+    /// can start as soon as it becomes ready instead of losing the one attempt
+    /// to a startup race (Bluetooth can take >1s to power on after launch).
+    private var shouldAdvertiseWhenReady: Bool = false
+
     public init(
         rssiThreshold: Int = TouchBridgeConstants.defaultRSSIThreshold,
         serviceUUID: String = TouchBridgeConstants.serviceUUID
@@ -131,14 +134,15 @@ public class BLEServer: NSObject, BLEServerInterface {
     // MARK: - Public API
 
     /// Start advertising the TouchBridge BLE service.
+    ///
+    /// If called before Bluetooth is powered on, the request is deferred and
+    /// fulfilled automatically once the peripheral manager reports poweredOn —
+    /// so a slow Bluetooth stack at launch never silently drops advertising.
     public func startAdvertising() {
-        wantsAdvertising = true
-        startAdvertisingIfReady()
-    }
-
-    private func startAdvertisingIfReady() {
-        guard isReady, isServiceRegistered, !isAdvertising else {
-            logger.info("Deferring advertising: ready=\(self.isReady), serviceRegistered=\(self.isServiceRegistered), advertising=\(self.isAdvertising)")
+        if isAdvertising { return }
+        guard isReady else {
+            shouldAdvertiseWhenReady = true
+            logger.info("Advertising requested before Bluetooth ready — deferring until poweredOn")
             return
         }
 
@@ -152,7 +156,6 @@ public class BLEServer: NSObject, BLEServerInterface {
 
     /// Stop advertising.
     public func stopAdvertising() {
-        wantsAdvertising = false
         guard isAdvertising else { return }
         peripheralManager.stopAdvertising()
         isAdvertising = false
@@ -295,11 +298,15 @@ extension BLEServer: CBPeripheralManagerDelegate {
             logger.info("Bluetooth powered on")
             isReady = true
             buildService()
+            // Fulfil any advertising request that arrived before we were ready.
+            if shouldAdvertiseWhenReady {
+                shouldAdvertiseWhenReady = false
+                startAdvertising()
+            }
         case .poweredOff:
             logger.warning("Bluetooth powered off")
             isReady = false
             isAdvertising = false
-            isServiceRegistered = false
         case .unauthorized:
             logger.error("Bluetooth unauthorized — check Info.plist NSBluetoothAlwaysUsageDescription")
             isReady = false
@@ -321,10 +328,6 @@ extension BLEServer: CBPeripheralManagerDelegate {
             logger.error("Failed to add service: \(error.localizedDescription)")
         } else {
             logger.info("Service added successfully")
-            isServiceRegistered = true
-            if wantsAdvertising {
-                startAdvertisingIfReady()
-            }
         }
     }
 

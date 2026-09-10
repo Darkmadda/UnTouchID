@@ -1,7 +1,9 @@
 package dev.touchbridge.android.ui.screens
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -9,25 +11,32 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+
+private val ConnectedGreen = Color(0xFF30D158)
+private val WaitingOrange = Color(0xFFFF9500)
 
 @Composable
 fun HomeScreen(
     viewModel: TouchBridgeViewModel,
     uiState: TouchBridgeUiState,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onRequestPermissions: () -> Unit = {},
+    onAddMac: () -> Unit = {},
 ) {
+    var macToUnpair by remember { mutableStateOf<MacStatus?>(null) }
+
     Column(
         modifier = modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
-        // Status indicator
+        // Overall status indicator
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
@@ -36,28 +45,20 @@ fun HomeScreen(
         ) {
             Surface(
                 color = if (uiState.isConnected)
-                    Color(0xFF30D158).copy(alpha = 0.15f)
+                    ConnectedGreen.copy(alpha = 0.15f)
                 else
                     Color.Gray.copy(alpha = 0.1f),
                 shape = CircleShape,
                 modifier = Modifier.fillMaxSize()
             ) {}
 
-            Text(
-                text = "🔐",
-                fontSize = 48.sp,
-            )
+            Text(text = "🔐", fontSize = 48.sp)
         }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Connection status
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Surface(
-                color = if (uiState.isConnected) Color(0xFF30D158) else Color(0xFFFF9500),
-                shape = CircleShape,
-                modifier = Modifier.size(8.dp)
-            ) {}
+            StatusDot(connected = uiState.isConnected)
             Spacer(modifier = Modifier.width(8.dp))
             Text(
                 text = uiState.statusMessage,
@@ -66,16 +67,32 @@ fun HomeScreen(
             )
         }
 
-        uiState.pairedMacName?.let { name ->
-            Text(
-                text = name,
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp)
-            )
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // Paired Macs
+        Text(
+            text = "Paired Macs",
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 8.dp)
+        )
+
+        uiState.macs.forEach { mac ->
+            MacRow(mac = mac, onUnpair = { macToUnpair = mac })
+            Spacer(modifier = Modifier.height(8.dp))
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
+        OutlinedButton(
+            onClick = onAddMac,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Add another Mac")
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
 
         // Stats
         if (uiState.challengeCount > 0) {
@@ -91,9 +108,18 @@ fun HomeScreen(
         }
 
         Spacer(modifier = Modifier.weight(1f))
+        Spacer(modifier = Modifier.height(16.dp))
 
-        // Reconnect button
-        if (!uiState.isConnected) {
+        if (!uiState.hasPermissions) {
+            Button(
+                onClick = onRequestPermissions,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+            ) {
+                Text("Grant Bluetooth Permission")
+            }
+        } else if (uiState.macs.any { !it.isConnected }) {
             Button(
                 onClick = { viewModel.startScanning() },
                 modifier = Modifier
@@ -103,17 +129,74 @@ fun HomeScreen(
                 Text("Reconnect")
             }
         }
+    }
 
-        // Unpair button
-        TextButton(
-            onClick = { viewModel.unpair() },
-            colors = ButtonDefaults.textButtonColors(
-                contentColor = MaterialTheme.colorScheme.error
-            )
+    macToUnpair?.let { mac ->
+        AlertDialog(
+            onDismissRequest = { macToUnpair = null },
+            title = { Text("Unpair ${mac.name}?") },
+            text = {
+                Text(
+                    if (uiState.macs.size == 1)
+                        "This is your only paired Mac. Unpairing removes this phone's signing key; you'll need to pair again from scratch."
+                    else
+                        "This phone will stop approving sign-ins on ${mac.name}. Your other Macs are unaffected."
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.unpair(mac.id)
+                        macToUnpair = null
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Unpair")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { macToUnpair = null }) { Text("Cancel") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun MacRow(mac: MacStatus, onUnpair: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Unpair")
+            StatusDot(connected = mac.isConnected)
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(mac.name, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text(
+                    text = if (mac.isConnected) "Connected" else "Not in range",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            TextButton(
+                onClick = onUnpair,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+            ) {
+                Text("Unpair")
+            }
         }
     }
+}
+
+@Composable
+private fun StatusDot(connected: Boolean) {
+    Surface(
+        color = if (connected) ConnectedGreen else WaitingOrange,
+        shape = CircleShape,
+        modifier = Modifier.size(8.dp)
+    ) {}
 }
 
 @Composable

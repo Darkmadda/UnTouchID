@@ -330,7 +330,7 @@ struct HomeView: View {
                 // Actions
                 if !appState.isConnected {
                     Button {
-                        appState.coordinator.resetConnectionAndScan()
+                        appState.coordinator.startScanning()
                         appState.statusMessage = "Scanning..."
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     } label: {

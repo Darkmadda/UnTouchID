@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -25,10 +26,6 @@ android {
         compose = true
     }
 
-    composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.8"
-    }
-
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -41,7 +38,7 @@ android {
 
 dependencies {
     // Compose
-    implementation(platform("androidx.compose:compose-bom:2024.01.00"))
+    implementation(platform("androidx.compose:compose-bom:2024.09.01"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
@@ -58,4 +55,11 @@ dependencies {
 
     // Core
     implementation("androidx.core:core-ktx:1.12.0")
+
+    // QR code scanning for pairing (declares/requests CAMERA itself)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
+    // Unit tests (JVM)
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20231013")
 }

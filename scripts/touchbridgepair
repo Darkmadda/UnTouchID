@@ -1,0 +1,2 @@
+#!/bin/bash
+launchctl bootout gui/$(id -u)/dev.touchbridge.daemon && touchbridge-test pair && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.touchbridge.daemon.plist

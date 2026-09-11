@@ -153,9 +153,12 @@ PLIST
 chown "$ACTUAL_USER" "$LAUNCH_AGENT_PLIST"
 chmod 644 "$LAUNCH_AGENT_PLIST"
 
-# Load the agent
+# Load the agent. A bootstrap immediately after a bootout can leave the job
+# registered but never launched (state "not running", runs = 0), so always
+# follow it with a kickstart to force the launch.
 launchctl bootstrap "gui/$ACTUAL_UID" "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
-info "LaunchAgent installed and loaded."
+launchctl kickstart -k "gui/$ACTUAL_UID/$LAUNCH_AGENT_LABEL" 2>/dev/null || true
+info "LaunchAgent installed and started."
 
 # --- Verification ---
 
@@ -163,11 +166,11 @@ echo ""
 info "=== Installation Complete ==="
 echo ""
 
-# Check daemon is running
-if launchctl print "gui/$ACTUAL_UID/$LAUNCH_AGENT_LABEL" &>/dev/null; then
+# Check daemon is actually running (not just registered with launchd)
+if launchctl print "gui/$ACTUAL_UID/$LAUNCH_AGENT_LABEL" 2>/dev/null | grep -q 'state = running'; then
     info "Daemon is running."
 else
-    warn "Daemon may not be running yet. Check: launchctl print gui/$ACTUAL_UID/$LAUNCH_AGENT_LABEL"
+    warn "Daemon is registered but not running. Try: launchctl kickstart -k gui/$ACTUAL_UID/$LAUNCH_AGENT_LABEL"
 fi
 
 # Check socket

@@ -1,5 +1,58 @@
 # Changelog
 
+## [Unreleased]
+
+### Security
+- **PAM module now verifies the daemon's identity before trusting it.** The
+  daemon socket lives in the user's home, so any same-user process could unlink
+  it, bind an impostor that answers `"result":"success"`, and obtain root via
+  `sudo`. `pam_touchbridge` now asks the kernel who is on the other end of the
+  socket and requires: the peer runs as the user being authenticated, its
+  executable is the root-owned installed daemon (`daemon=` option, default
+  `/usr/local/bin/touchbridged`; the file and its directory must not be
+  writable by others), and its running code satisfies the on-disk binary's
+  code-signing designated requirement. No shared secret is involved.
+- **Simulator and web modes are refused by default.** Both approve without a
+  paired phone, so a same-user process could start one against the real socket
+  path. The daemon now tags every PAM response with its mode; the module only
+  honours `production` unless root adds `allow_mode=simulator` / `allow_mode=web`
+  to the PAM line. Responses without a mode (older daemon) are refused too.
+- `install.sh` now sets root ownership on the daemon binary explicitly, ad-hoc
+  signs it if unsigned, and warns when its directory is not root-owned.
+
+### Added
+- **GUI admin prompts** (System Settings, installers, any app using
+  Authorization Services) can be approved on the phone. The PAM service file is
+  `screensaver_new` on macOS 26 and `authorization` on older releases;
+  `install.sh` and `patch-pam.sh` patch whichever exists, `uninstall.sh` removes
+  it. New `authorization` / `screensaver_new` surface policies (biometric
+  required), and the daemon maps these service names to a plain-language
+  approval reason ("administrator access") on the companion.
+- `make -C pam test` runs the daemon identity checks against a real Unix
+  socket served by a signed system binary, and against the live daemon.
+- `make -C pam install` and an `install`-safe copy in `install.sh` remove the
+  target before copying so a reinstall never leaves a stale code-signature blob.
+
+### Fixed
+- **`sudo` killed with "Killed: 9" during reinstall.** `install.sh` copied the
+  new PAM module and daemon over the existing files in place, which left the
+  kernel serving a stale code-signature blob for the reused inode; the next
+  `sudo` (including the installer's own `sudo -u` calls) died in dyld with
+  `CODESIGNING Invalid Page`. Both binaries are now removed before copying so
+  they land on fresh inodes.
+
+### Changed
+- The PAM module logs through `openpam_log(3)` instead of `syslog(3)`, so its
+  messages appear in the unified log in the clear (`syslog` text from inside
+  sudo/loginwindow/authorizationhost is stored redacted as `<private>`). It also
+  logs one `entry` line per call with the host process uid and whether a
+  password was already supplied, which is what pinpointed that macOS 26 routes
+  admin prompts through `screensaver_new`, not `authorization`.
+- When the calling app has already collected a password (lock screen and
+  GUI admin dialogs set `PAM_AUTHTOK` up front), the module returns
+  `PAM_IGNORE` instead of contacting the phone, so typing a password no longer
+  waits on a phone prompt. Leave the field empty to use the phone.
+
 ## [1.1.2] — 2026-07-17
 
 ### Changed

@@ -26,6 +26,10 @@ public struct SurfacePolicy: Codable, Sendable {
 /// Default policy:
 /// - sudo → always require biometric
 /// - screensaver → proximity session (30 min)
+/// - authorization / screensaver_new → always require biometric
+///   (macOS GUI admin prompts: System Settings, installers, and any app using
+///   Authorization Services. The PAM service is "authorization" on older macOS
+///   and "screensaver_new" on macOS 26.)
 /// - app_store → always require biometric
 /// - system_settings → always require biometric
 /// - browser_autofill → proximity session (10 min)
@@ -39,6 +43,8 @@ public final class PolicyEngine: Sendable {
     private static let defaults: [String: SurfacePolicy] = [
         "sudo": SurfacePolicy(mode: .biometricRequired),
         "screensaver": SurfacePolicy(mode: .proximitySession, sessionTTLSeconds: 1800),
+        "authorization": SurfacePolicy(mode: .biometricRequired),
+        "screensaver_new": SurfacePolicy(mode: .biometricRequired),
         "app_store": SurfacePolicy(mode: .biometricRequired),
         "system_settings": SurfacePolicy(mode: .biometricRequired),
         "browser_autofill": SurfacePolicy(mode: .proximitySession, sessionTTLSeconds: 600),

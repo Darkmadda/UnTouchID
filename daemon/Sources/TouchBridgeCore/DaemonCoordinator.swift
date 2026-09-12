@@ -158,6 +158,26 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
     /// Broadcasts to every connected, paired device simultaneously.
     /// The first valid response wins — other challenges expire naturally.
     /// Blocks until a response arrives or the timeout expires.
+    /// Human-readable approval text shown on the companion for a PAM service.
+    /// Unknown services fall back to their raw name so nothing is hidden.
+    static func companionReason(for service: String) -> String {
+        switch service {
+        case "sudo":
+            return "sudo (administrator command)"
+        case "screensaver":
+            return "unlock this Mac"
+        // macOS GUI admin prompts: System Settings, installers, Authorization
+        // Services. The service file is screensaver_new on macOS 26,
+        // authorization on older releases.
+        case "screensaver_new", "authorization":
+            return "administrator access"
+        case "login":
+            return "log in to this Mac"
+        default:
+            return service
+        }
+    }
+
     public func authenticateFromPAM(
         user: String,
         service: String,
@@ -182,7 +202,11 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
             return (false, "no_companion_connected")
         }
 
-        logger.info("PAM auth: broadcasting challenge to \(targets.count) device(s)")
+        // The PAM service name reaches the companion as the approval reason. Raw
+        // names like "screensaver_new" (the macOS 26 GUI admin-prompt service)
+        // are cryptic on the phone, so map the known ones to plain language.
+        let challengeReason = Self.companionReason(for: service)
+        logger.info("PAM auth: broadcasting challenge to \(targets.count) device(s) reason=\(challengeReason)")
 
         // Race: first device response OR global timeout — whichever fires first wins.
         //
@@ -205,7 +229,7 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
             Task {
                 var issued = 0
                 for centralID in targets {
-                    if let challengeID = await self.issueChallenge(to: centralID, reason: service) {
+                    if let challengeID = await self.issueChallenge(to: centralID, reason: challengeReason) {
                         self.stateLock.withLock {
                             self.pendingAuthentications[challengeID] = wrapped
                         }

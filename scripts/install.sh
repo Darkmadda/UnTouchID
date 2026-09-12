@@ -3,7 +3,9 @@ set -euo pipefail
 
 # TouchBridge Installer
 # Builds and installs the daemon, PAM module, and LaunchAgent.
-# Patches /etc/pam.d/sudo and /etc/pam.d/screensaver with user confirmation.
+# Patches /etc/pam.d/sudo, /etc/pam.d/screensaver and the GUI admin-prompt
+# service file (screensaver_new on macOS 26, authorization on older) with
+# user confirmation.
 # Fully idempotent — safe to run multiple times.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -86,15 +88,45 @@ info "PAM module built successfully."
 
 # --- Install Binaries ---
 
+# Never overwrite a signed Mach-O in place. `cp` onto an existing file reuses
+# the inode, and the kernel keeps serving the old code-signature blob for it —
+# the next process to map the file dies with "Killed: 9" (CODESIGNING Invalid
+# Page). That process is `sudo` for the PAM module, and this very script is
+# what runs it. Remove first so the copy lands on a fresh inode.
+install_fresh() {
+    local src="$1" dst="$2"
+    rm -f "$dst"
+    cp "$src" "$dst"
+}
+
 info "Installing daemon binary..."
 mkdir -p "$(dirname "$DAEMON_BIN")"
-cp "$DAEMON_BUILD" "$DAEMON_BIN"
+install_fresh "$DAEMON_BUILD" "$DAEMON_BIN"
+# The PAM module only trusts a daemon whose binary and parent directory are
+# root-owned and not writable by anyone else, and whose running code matches
+# the file on disk. `cp` over an existing file keeps the old owner, so set
+# ownership explicitly, and make sure the binary carries a code signature
+# (ad-hoc is fine; set TB_CODESIGN_IDENTITY to use a real one).
+chown root:wheel "$DAEMON_BIN"
 chmod 755 "$DAEMON_BIN"
+if [ -n "${TB_CODESIGN_IDENTITY:-}" ]; then
+    codesign --force --sign "$TB_CODESIGN_IDENTITY" "$DAEMON_BIN"
+elif ! codesign --verify "$DAEMON_BIN" 2>/dev/null; then
+    codesign --force --sign - "$DAEMON_BIN"
+fi
+DAEMON_DIR="$(dirname "$DAEMON_BIN")"
+DAEMON_DIR_OWNER=$(stat -f '%u' "$DAEMON_DIR")
+if [ "$DAEMON_DIR_OWNER" != "0" ] || [ -n "$(find "$DAEMON_DIR" -maxdepth 0 -perm +022)" ]; then
+    warn "$DAEMON_DIR is not root-owned and unwritable by others (owner uid $DAEMON_DIR_OWNER)."
+    warn "pam_touchbridge will refuse to trust the daemon until it is, e.g.:"
+    warn "  sudo chown root:wheel $DAEMON_DIR && sudo chmod 755 $DAEMON_DIR"
+fi
 info "Installed $DAEMON_BIN"
 
 info "Installing PAM module..."
 mkdir -p "$(dirname "$PAM_LIB")"
-cp "$PAM_BUILD" "$PAM_LIB"
+install_fresh "$PAM_BUILD" "$PAM_LIB"
+chown root:wheel "$PAM_LIB"
 chmod 444 "$PAM_LIB"
 info "Installed $PAM_LIB"
 
@@ -114,6 +146,7 @@ source "$SCRIPT_DIR/pam-common.sh"
 
 tb_enable_sudo "prompt"
 tb_enable_screensaver "prompt"
+tb_enable_gui_admin "prompt"
 
 # --- Install LaunchAgent ---
 
@@ -186,4 +219,5 @@ echo "Next steps:"
 echo "  1. Open TouchBridge on your iPhone to pair"
 echo "  2. Run: touchbridge-test pair"
 echo "  3. Test: sudo echo 'TouchBridge works!'"
+echo "  4. GUI admin prompts: leave the password empty, click OK, approve on your phone"
 echo ""

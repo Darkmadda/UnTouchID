@@ -16,20 +16,39 @@ public struct PAMRequest: Codable, Sendable {
     }
 }
 
+/// How the daemon is deciding auth requests. Reported in every PAM response.
+///
+/// The PAM module only honours `production` answers unless root has opted in
+/// to another mode on the PAM line (`allow_mode=simulator`). Simulator and web
+/// modes approve without a paired phone, so a same-user process could start
+/// one and use it to obtain root through sudo if the module trusted it blindly.
+public enum DaemonMode: String, Codable, Sendable {
+    /// Real companion devices over BLE / Wi-Fi with Secure Enclave signatures.
+    case production
+    /// `--simulator` / `--interactive`: software keys, no phone.
+    case simulator
+    /// `--web`: approve from any browser on the local network via a one-time URL.
+    case web
+}
+
 /// JSON response to the PAM module.
 public struct PAMResponse: Codable, Sendable {
     public let result: String
     public let reason: String?
+    public let mode: DaemonMode
 
-    public init(result: String, reason: String? = nil) {
+    public init(result: String, reason: String? = nil, mode: DaemonMode = .production) {
         self.result = result
         self.reason = reason
+        self.mode = mode
     }
 
-    public static let success = PAMResponse(result: "success")
+    public static func success(mode: DaemonMode = .production) -> PAMResponse {
+        PAMResponse(result: "success", mode: mode)
+    }
 
-    public static func failure(_ reason: String) -> PAMResponse {
-        PAMResponse(result: "failure", reason: reason)
+    public static func failure(_ reason: String, mode: DaemonMode = .production) -> PAMResponse {
+        PAMResponse(result: "failure", reason: reason, mode: mode)
     }
 }
 
@@ -48,6 +67,8 @@ public final class SocketServer: @unchecked Sendable {
     private let socketPath: String
     private let authHandler: PAMAuthHandler
     private let policyEngine: PolicyEngine
+    /// Reported to the PAM module in every response; see `DaemonMode`.
+    public let mode: DaemonMode
 
     private var serverFD: Int32 = -1
     private var acceptSource: DispatchSourceRead?
@@ -59,10 +80,12 @@ public final class SocketServer: @unchecked Sendable {
     public init(
         authHandler: PAMAuthHandler,
         policyEngine: PolicyEngine = PolicyEngine(),
-        socketPath: String? = nil
+        socketPath: String? = nil,
+        mode: DaemonMode = .production
     ) {
         self.authHandler = authHandler
         self.policyEngine = policyEngine
+        self.mode = mode
 
         if let path = socketPath {
             self.socketPath = path
@@ -201,7 +224,7 @@ public final class SocketServer: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard let requestData = requestString.data(using: .utf8) else {
-            sendResponse(fd: fd, response: .failure("invalid_request"))
+            sendResponse(fd: fd, response: .failure("invalid_request", mode: mode))
             return
         }
 
@@ -211,12 +234,12 @@ public final class SocketServer: @unchecked Sendable {
             request = try JSONDecoder().decode(PAMRequest.self, from: requestData)
         } catch {
             logger.warning("Failed to parse PAM request: \(error.localizedDescription)")
-            sendResponse(fd: fd, response: .failure("parse_error"))
+            sendResponse(fd: fd, response: .failure("parse_error", mode: mode))
             return
         }
 
         guard request.action == "authenticate" else {
-            sendResponse(fd: fd, response: .failure("unknown_action"))
+            sendResponse(fd: fd, response: .failure("unknown_action", mode: mode))
             return
         }
 
@@ -231,10 +254,12 @@ public final class SocketServer: @unchecked Sendable {
             timeout: timeout
         )
 
-        let response = success ? PAMResponse.success : PAMResponse.failure(reason ?? "authentication_failed")
+        let response = success
+            ? PAMResponse.success(mode: mode)
+            : PAMResponse.failure(reason ?? "authentication_failed", mode: mode)
         sendResponse(fd: fd, response: response)
 
-        logger.info("PAM auth result: user=\(request.user) service=\(request.service) result=\(response.result)")
+        logger.info("PAM auth result: user=\(request.user) service=\(request.service) result=\(response.result) mode=\(self.mode.rawValue)")
     }
 
     private func sendResponse(fd: Int32, response: PAMResponse) {

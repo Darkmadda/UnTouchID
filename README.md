@@ -82,6 +82,11 @@ sudo bash scripts/install.sh
   <img src="assets/screenshots/sudo-auth.png" alt="sudo with TouchBridge" width="600">
 </p>
 
+> Simulator mode is a development convenience: it approves without a phone, so
+> the PAM module ignores it unless root has added `allow_mode=simulator` to the
+> TouchBridge line in `/etc/pam.d/sudo_local`. See
+> [Simulator mode](docs/setup.md#no-phone--simulator-mode) for the one-liner.
+
 ```bash
 # Terminal 1 — start daemon in simulator mode
 touchbridged serve --simulator
@@ -257,6 +262,11 @@ They're complementary — you'd use both. Passkeys for the web. TouchBridge for 
 | **Auto-lock** | `touchbridged serve --auto-lock` | Lock when phone leaves |
 
 Flags can be combined: `touchbridged serve --web --auto-lock`
+
+Every response the daemon sends to the PAM module is tagged with its mode.
+`pam_touchbridge` only accepts **Production** answers unless the PAM line
+carries `allow_mode=simulator` or `allow_mode=web` — a root-controlled
+opt-in, since those modes approve without a paired phone.
 
 ---
 

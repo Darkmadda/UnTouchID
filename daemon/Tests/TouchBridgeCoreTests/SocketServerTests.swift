@@ -91,11 +91,52 @@ private func makeTempSocketPath() -> String {
 
     let response = try sendToSocket(path: socketPath, message: request)
     #expect(response.contains("\"result\":\"success\""))
+    // Every response names the daemon mode; production is the default.
+    #expect(response.contains("\"mode\":\"production\""))
 
     // Verify handler received the request
     #expect(handler.lastRequest?.user == "testuser")
     #expect(handler.lastRequest?.service == "sudo")
     #expect(handler.lastRequest?.pid == 1234)
+}
+
+@Test func socketServerReportsSimulatorMode() async throws {
+    let socketPath = makeTempSocketPath()
+    defer { unlink(socketPath) }
+
+    let handler = MockPAMAuthHandler()
+    handler.shouldSucceed = true
+
+    let server = SocketServer(authHandler: handler, socketPath: socketPath, mode: .simulator)
+    try server.start()
+    defer { server.stop() }
+
+    try await Task.sleep(nanoseconds: 100_000_000)
+
+    let request = """
+    {"action":"authenticate","user":"testuser","service":"sudo","pid":1234}
+    """
+
+    let response = try sendToSocket(path: socketPath, message: request)
+    // The PAM module refuses this unless root added allow_mode=simulator.
+    #expect(response.contains("\"result\":\"success\""))
+    #expect(response.contains("\"mode\":\"simulator\""))
+}
+
+@Test func socketServerTagsErrorResponsesWithMode() async throws {
+    let socketPath = makeTempSocketPath()
+    defer { unlink(socketPath) }
+
+    let handler = MockPAMAuthHandler()
+    let server = SocketServer(authHandler: handler, socketPath: socketPath, mode: .web)
+    try server.start()
+    defer { server.stop() }
+
+    try await Task.sleep(nanoseconds: 100_000_000)
+
+    let response = try sendToSocket(path: socketPath, message: "not json at all")
+    #expect(response.contains("parse_error"))
+    #expect(response.contains("\"mode\":\"web\""))
 }
 
 @Test func socketServerAcceptsAndRespondsFailure() async throws {

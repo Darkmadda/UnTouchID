@@ -17,6 +17,7 @@ If you discover a security vulnerability in TouchBridge, please report it respon
 - **Replay attacks**: 32-byte nonces with 10-second expiry and 60-second seen-nonces window
 - **Man-in-the-middle**: ECDH ephemeral session keys with AES-256-GCM encryption on BLE channel
 - **Key theft**: Private signing key lives inside Secure Enclave — never exported, never leaves the chip
+- **Local privilege escalation through the daemon socket**: a same-user process cannot impersonate the daemon to mint a `sudo` or admin approval — see below
 
 ### What TouchBridge does NOT protect against
 
@@ -24,6 +25,44 @@ If you discover a security vulnerability in TouchBridge, please report it respon
 - **Keychain items with `kSecAccessControlBiometryCurrentSet`**: Cryptographically impossible — hardware ACL wall
 - **Sandboxed third-party apps calling `LAContext`**: Blocked by SIP and sandbox
 - **Compromised macOS kernel**: If the kernel is compromised, no user-space security holds
+- **A same-user attacker who can pair their own phone**: pairing is a user-level operation (`touchbridge-test pair`), so code running as you, with a phone in Bluetooth range, could pair it and approve its own requests. This requires physical presence, unlike the socket attack below.
+
+### Daemon identity verification (socket spoofing)
+
+The PAM module talks to the daemon over a Unix socket in the user's home
+directory. Anything running as that user could unlink the socket and bind an
+impostor that answers every request with `"result":"success"` — and because
+`sudo` grants root on a PAM success, that would be a local root escalation from
+ordinary user code. A shared secret cannot fix this: the daemon runs as the user,
+so any key it can read, the attacker can read too.
+
+Instead, after connecting, `pam_touchbridge` asks the kernel who the peer is and
+refuses to send a request unless all of the following hold:
+
+| Check | Mechanism | Defeats |
+|-------|-----------|---------|
+| Peer runs as the user being authenticated | `LOCAL_PEERCRED` | sockets served by another account |
+| Peer executable is the installed daemon (`daemon=` option, default `/usr/local/bin/touchbridged`) | `LOCAL_PEERTOKEN` + `proc_pidpath_audittoken` | any other binary bound to the socket path |
+| That binary and its directory are root-owned and not group/world writable | `stat` | swapping the file without root |
+| Peer's running code satisfies the on-disk binary's designated requirement | `SecCodeCopyGuestWithAttributes` + `SecCodeCheckValidity` | modified or foreign code claiming the path (ad-hoc builds pin the exact cdhash) |
+| Daemon reports `"mode":"production"` | JSON response field | the genuine binary started in `--simulator`, `--interactive`, or `--web` mode, which approve without a phone |
+
+The GUI admin-prompt PAM service is `authorization` on older macOS and
+`screensaver_new` on macOS 26; the installer patches whichever exists. The
+module reports the service name to the daemon as the surface, and unknown
+surfaces default to biometric-required — so a service we have not enumerated
+still gets the strongest policy, never a weaker one.
+
+The mode check can be relaxed per PAM line with `allow_mode=simulator` or
+`allow_mode=web`; since `/etc/pam.d` is root-owned, that is a root decision.
+Any failed check is logged to the auth log as `REFUSING socket peer` and PAM
+falls through to the password. `make -C pam test` exercises these checks.
+
+Consequences to be aware of: after upgrading the daemon binary, the *running*
+daemon no longer matches the file on disk and will be refused until it restarts
+(`install.sh` restarts it). On Intel Macs where Homebrew has made
+`/usr/local/bin` user-owned, the ownership check fails closed; `install.sh`
+warns and prints the `chown` to fix it.
 
 ### Availability note: PAM fallback vs. a dangling module reference
 

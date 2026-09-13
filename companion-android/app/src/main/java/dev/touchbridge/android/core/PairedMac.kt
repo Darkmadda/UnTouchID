@@ -16,19 +16,39 @@ import java.util.UUID
  */
 data class PairedMac(
     val id: String,
+    /** The name the Mac reported when pairing (its computer name). */
     val name: String,
     val pairedAt: Long,
+    /**
+     * User-chosen name for this Mac, or null to show [name]. Two Macs often
+     * share a computer name, so this is how the user tells rows apart.
+     */
+    val nickname: String? = null,
 ) {
     val serviceUUID: UUID get() = UUID.fromString(id)
+
+    /** What the UI shows for this Mac: the nickname if set, else the Mac's own name. */
+    val displayName: String get() = nickname ?: name
+
+    /** Copy with a new nickname; blank input clears it so [displayName] falls back to [name]. */
+    fun withNickname(raw: String?): PairedMac = copy(nickname = normalizeNickname(raw))
 
     fun toJson(): JSONObject = JSONObject()
         .put("id", id)
         .put("name", name)
         .put("pairedAt", pairedAt)
+        .apply { nickname?.let { put("nickname", it) } }
 
     companion object {
+        /** Longest nickname we store; keeps rows and notification titles readable. */
+        const val MAX_NICKNAME_LENGTH = 40
+
         /** Canonical id for a service UUID (lowercase, as produced by [UUID.toString]). */
         fun idFor(serviceUUID: UUID): String = serviceUUID.toString()
+
+        /** Trim and cap a nickname; returns null for blank input (meaning "use the Mac's name"). */
+        fun normalizeNickname(raw: String?): String? =
+            raw?.trim()?.take(MAX_NICKNAME_LENGTH)?.takeIf { it.isNotEmpty() }
 
         fun fromJson(json: JSONObject): PairedMac? {
             val id = json.optString("id", "")
@@ -37,6 +57,7 @@ data class PairedMac(
                 id = idFor(uuid),
                 name = json.optString("name", "Mac"),
                 pairedAt = json.optLong("pairedAt", 0L),
+                nickname = normalizeNickname(json.optString("nickname", "")),
             )
         }
 

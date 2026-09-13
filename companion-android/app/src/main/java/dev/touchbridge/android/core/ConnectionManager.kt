@@ -20,9 +20,14 @@ enum class PairingPhase { IDLE, SCANNING, CONNECTING, WAITING_FOR_MAC, PAIRED, E
 /** One paired Mac as shown in the UI. */
 data class MacStatus(
     val id: String,
+    /** Name to display: the user's nickname if set, else the Mac's own name. */
     val name: String,
     val isConnected: Boolean,
-)
+    /** The Mac's own computer name; equals [name] when no nickname is set. */
+    val macName: String = name,
+) {
+    val hasNickname: Boolean get() = name != macName
+}
 
 data class TouchBridgeUiState(
     val macs: List<MacStatus> = emptyList(),
@@ -108,7 +113,7 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
     private fun publish(transform: (TouchBridgeUiState) -> TouchBridgeUiState = { it }) {
         val hasPerms = PermissionUtils.hasBluetoothPermissions(appContext)
         val macs = synchronized(lock) {
-            pairedMacs.values.map { MacStatus(it.id, it.name, bleClient.isConnected(it.id)) }
+            pairedMacs.values.map { MacStatus(it.id, it.displayName, bleClient.isConnected(it.id), it.name) }
         }
         _uiState.update {
             transform(it).copy(
@@ -121,6 +126,7 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
 
     private fun statusMessage(macs: List<MacStatus>, hasPerms: Boolean): String {
         if (!hasPerms) return "Bluetooth permissions required"
+        if (!bleClient.isAdapterEnabled) return "Bluetooth is off"
         if (macs.isEmpty()) return "Not connected"
         val connected = macs.filter { it.isConnected }
         return when {
@@ -133,7 +139,7 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
     }
 
     private fun macName(macId: String): String = synchronized(lock) {
-        pairedMacs[macId]?.name ?: pendingPairing?.takeIf { it.mac.id == macId }?.mac?.name ?: "Mac"
+        pairedMacs[macId]?.displayName ?: pendingPairing?.takeIf { it.mac.id == macId }?.mac?.displayName ?: "Mac"
     }
 
     // MARK: - Scanning / reconnection
@@ -235,7 +241,9 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
 
     private fun completePairing(pending: PendingPairing) {
         val macs = synchronized(lock) {
-            pairedMacs[pending.mac.id] = pending.mac
+            // Re-pairing refreshes the Mac's own name but keeps any nickname the user chose.
+            val nickname = pairedMacs[pending.mac.id]?.nickname
+            pairedMacs[pending.mac.id] = pending.mac.copy(nickname = nickname)
             pendingPairing = null
             pairedMacs.values.toList()
         }
@@ -252,6 +260,29 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
         }
         publish { it.copy(pairingPhase = PairingPhase.ERROR, pairingError = message) }
         Log.w(TAG, "Pairing with ${pending.mac.name} failed: $message")
+    }
+
+    // MARK: - Renaming
+
+    /**
+     * Give a paired Mac a friendlier name, or pass blank/null to go back to the
+     * name the Mac reported. Only the phone's label changes; the Mac is not told.
+     */
+    fun rename(macId: String, nickname: String?) {
+        val macs = synchronized(lock) {
+            val mac = pairedMacs[macId] ?: return
+            pairedMacs[macId] = mac.withNickname(nickname)
+            pairedMacs.values.toList()
+        }
+        store.save(macs)
+        publish {
+            it.copy(
+                pendingChallenge = it.pendingChallenge?.let { c ->
+                    if (c.macId == macId) c.copy(macName = macName(macId)) else c
+                }
+            )
+        }
+        Log.i(TAG, "Renamed Mac $macId")
     }
 
     // MARK: - Unpairing
@@ -367,6 +398,14 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
     }
 
     // MARK: - BLEClient.Listener
+
+    override fun onAdapterStateChanged(enabled: Boolean) {
+        if (enabled) {
+            // Give the freshly powered adapter a moment before asking it to scan.
+            mainHandler.postDelayed({ refreshScanning() }, RESCAN_DELAY_MS)
+        }
+        publish()
+    }
 
     override fun onDeviceDiscovered(macId: String, deviceAddress: String, rssi: Int) {
         if (bleClient.hasLink(macId)) return

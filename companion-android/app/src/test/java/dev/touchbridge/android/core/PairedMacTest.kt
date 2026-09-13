@@ -55,6 +55,38 @@ class PairedMacTest {
     }
 
     @Test
+    fun `nickname round-trips and drives displayName`() {
+        val renamed = a.withNickname("  Work laptop  ")
+        assertEquals("Work laptop", renamed.nickname)
+        assertEquals("Work laptop", renamed.displayName)
+        assertEquals("Dylan's MacBook Pro", renamed.name)
+        assertEquals(listOf(renamed, b), PairedMac.listFromJson(PairedMac.listToJson(listOf(renamed, b))))
+    }
+
+    @Test
+    fun `blank nickname clears it and displayName falls back to the Mac's name`() {
+        val renamed = a.withNickname("Work laptop")
+        assertNull(renamed.withNickname("   ").nickname)
+        assertNull(renamed.withNickname(null).nickname)
+        assertEquals(a, renamed.withNickname(""))
+        assertEquals("Dylan's MacBook Pro", a.displayName)
+    }
+
+    @Test
+    fun `nickname is capped at the maximum length`() {
+        val long = "x".repeat(PairedMac.MAX_NICKNAME_LENGTH + 10)
+        assertEquals(PairedMac.MAX_NICKNAME_LENGTH, a.withNickname(long).nickname!!.length)
+    }
+
+    @Test
+    fun `entries stored before nicknames existed load with no nickname`() {
+        val json = """[{"id":"${a.id}","name":"Dylan's MacBook Pro","pairedAt":1}]"""
+        val loaded = PairedMac.listFromJson(json).single()
+        assertNull(loaded.nickname)
+        assertEquals("Dylan's MacBook Pro", loaded.displayName)
+    }
+
+    @Test
     fun `entry without a valid id is rejected`() {
         assertNull(PairedMac.fromJson(org.json.JSONObject("""{"name":"Nameless"}""")))
     }

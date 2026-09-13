@@ -3,9 +3,13 @@ package dev.touchbridge.android.core
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.ParcelUuid
 import android.util.Log
+import androidx.core.content.ContextCompat
 import dev.touchbridge.android.Constants
 import dev.touchbridge.android.util.PermissionUtils
 import java.util.UUID
@@ -33,6 +37,8 @@ class BLEClient(private val context: Context) {
     }
 
     interface Listener {
+        /** The phone's Bluetooth adapter was switched on (true) or off (false). */
+        fun onAdapterStateChanged(enabled: Boolean)
         fun onDeviceDiscovered(macId: String, deviceAddress: String, rssi: Int)
         fun onConnectionChanged(macId: String, connected: Boolean)
         /** Characteristics discovered and notifications enabled — safe to write. */
@@ -47,6 +53,44 @@ class BLEClient(private val context: Context) {
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val bluetoothAdapter: BluetoothAdapter? get() = bluetoothManager.adapter
     private var scanner: BluetoothLeScanner? = null
+
+    /** Whether the phone's Bluetooth radio is currently on. */
+    val isAdapterEnabled: Boolean get() = bluetoothAdapter?.isEnabled == true
+
+    /**
+     * When the user toggles Bluetooth off, the running scan and every GATT
+     * connection die with the radio — and the stack does not reliably deliver
+     * onScanFailed / STATE_DISCONNECTED for them. Track the adapter ourselves so
+     * our state is reset on OFF and the owner can rescan on ON.
+     */
+    private val adapterStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> onAdapterOff()
+                BluetoothAdapter.STATE_ON -> {
+                    Log.i(TAG, "Bluetooth adapter is on")
+                    listener?.onAdapterStateChanged(true)
+                }
+            }
+        }
+    }
+
+    private fun onAdapterOff() {
+        // Fires for TURNING_OFF and again for OFF; the teardown only runs once.
+        val dropped = links.keys.toList()
+        if (isScanning || dropped.isNotEmpty()) {
+            Log.i(TAG, "Bluetooth adapter is off — dropping scan and ${dropped.size} link(s)")
+            // The system scan is gone with the radio; stopScan on a dead adapter throws.
+            isScanning = false
+            scanTargets = emptyMap()
+            synchronized(discovered) { discovered.clear() }
+            links.values.toList().forEach { it.close() }
+            links.clear()
+            dropped.forEach { listener?.onConnectionChanged(it, false) }
+        }
+        listener?.onAdapterStateChanged(false)
+    }
 
     /** serviceUUID → macId for the scan currently running. */
     private var scanTargets: Map<UUID, String> = emptyMap()
@@ -63,6 +107,15 @@ class BLEClient(private val context: Context) {
     fun hasLink(macId: String): Boolean = links.containsKey(macId)
     fun isConnected(macId: String): Boolean = links[macId]?.connected == true
     val connectedMacIds: Set<String> get() = links.filterValues { it.connected }.keys
+
+    init {
+        ContextCompat.registerReceiver(
+            context,
+            adapterStateReceiver,
+            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+    }
 
     // MARK: - Scanning
 
@@ -81,6 +134,11 @@ class BLEClient(private val context: Context) {
 
         if (!PermissionUtils.hasBluetoothPermissions(context)) {
             Log.w(TAG, "Cannot start scan: missing Bluetooth permissions")
+            return false
+        }
+
+        if (!isAdapterEnabled) {
+            Log.w(TAG, "Cannot start scan: Bluetooth is off")
             return false
         }
 
@@ -111,6 +169,11 @@ class BLEClient(private val context: Context) {
             Log.e(TAG, "SecurityException while starting scan", e)
             isScanning = false
             return false
+        } catch (e: IllegalStateException) {
+            // Thrown while the adapter is mid-transition ("BT Adapter is not turned ON").
+            Log.w(TAG, "Cannot start scan: ${e.message}")
+            isScanning = false
+            return false
         }
     }
 
@@ -119,9 +182,11 @@ class BLEClient(private val context: Context) {
         isScanning = false
         if (!PermissionUtils.hasBluetoothPermissions(context)) return
         try {
-            scanner?.stopScan(scanCallback)
+            if (isAdapterEnabled) scanner?.stopScan(scanCallback)
         } catch (e: SecurityException) {
             Log.e(TAG, "SecurityException while stopping scan", e)
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "stopScan while adapter off: ${e.message}")
         } finally {
             Log.i(TAG, "Stopped scanning")
         }
@@ -242,8 +307,9 @@ class BLEClient(private val context: Context) {
             try {
                 gatt?.disconnect()
                 gatt?.close()
-            } catch (e: SecurityException) {
-                Log.e(TAG, "SecurityException while disconnecting $macId", e)
+            } catch (e: Exception) {
+                // SecurityException, or IllegalStateException if the adapter is already off.
+                Log.e(TAG, "Error while disconnecting $macId", e)
             } finally {
                 clear()
             }
@@ -368,10 +434,11 @@ class BLEClient(private val context: Context) {
                         } catch (e: SecurityException) {
                             Log.e(TAG, "SecurityException closing GATT", e)
                         }
-                        // Only forget ourselves — a newer link for the same Mac may already exist.
-                        links.remove(macId, this@MacLink)
+                        // Only forget ourselves — a newer link for the same Mac may already
+                        // exist, and a link dropped by onAdapterOff() has already been reported.
+                        val wasTracked = links.remove(macId, this@MacLink)
                         clear()
-                        listener?.onConnectionChanged(macId, false)
+                        if (wasTracked) listener?.onConnectionChanged(macId, false)
                     }
                 }
             }

@@ -30,6 +30,7 @@ class TouchBridgeViewModel(app: Application) : AndroidViewModel(app) {
     fun resetPairing() = manager.resetPairing()
     fun startScanning() = manager.startScanning()
     fun unpair(macId: String) = manager.unpair(macId)
+    fun rename(macId: String, nickname: String?) = manager.rename(macId, nickname)
 
     class Factory(private val app: Application) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")

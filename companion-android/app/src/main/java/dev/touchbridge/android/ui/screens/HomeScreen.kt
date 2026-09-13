@@ -9,8 +9,16 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import dev.touchbridge.android.core.PairedMac
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -26,6 +34,7 @@ fun HomeScreen(
     onAddMac: () -> Unit = {},
 ) {
     var macToUnpair by remember { mutableStateOf<MacStatus?>(null) }
+    var macToRename by remember { mutableStateOf<MacStatus?>(null) }
 
     Column(
         modifier = modifier
@@ -81,7 +90,7 @@ fun HomeScreen(
         )
 
         uiState.macs.forEach { mac ->
-            MacRow(mac = mac, onUnpair = { macToUnpair = mac })
+            MacRow(mac = mac, onRename = { macToRename = mac }, onUnpair = { macToUnpair = mac })
             Spacer(modifier = Modifier.height(8.dp))
         }
 
@@ -131,6 +140,17 @@ fun HomeScreen(
         }
     }
 
+    macToRename?.let { mac ->
+        RenameMacDialog(
+            mac = mac,
+            onConfirm = { nickname ->
+                viewModel.rename(mac.id, nickname)
+                macToRename = null
+            },
+            onDismiss = { macToRename = null },
+        )
+    }
+
     macToUnpair?.let { mac ->
         AlertDialog(
             onDismissRequest = { macToUnpair = null },
@@ -162,7 +182,9 @@ fun HomeScreen(
 }
 
 @Composable
-private fun MacRow(mac: MacStatus, onUnpair: () -> Unit) {
+private fun MacRow(mac: MacStatus, onRename: () -> Unit, onUnpair: () -> Unit) {
+    var menuOpen by remember { mutableStateOf(false) }
+
     Card(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
@@ -175,19 +197,89 @@ private fun MacRow(mac: MacStatus, onUnpair: () -> Unit) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(mac.name, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                 Text(
-                    text = if (mac.isConnected) "Connected" else "Not in range",
+                    text = buildString {
+                        append(if (mac.isConnected) "Connected" else "Not in range")
+                        // When renamed, keep the Mac's own name visible so it can still be matched
+                        // to what System Settings shows.
+                        if (mac.hasNickname) append(" · ").append(mac.macName)
+                    },
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            TextButton(
-                onClick = onUnpair,
-                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
-            ) {
-                Text("Unpair")
+            Box {
+                TextButton(onClick = { menuOpen = true }) {
+                    Text("⋮", fontSize = 20.sp)
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text("Rename") },
+                        onClick = { menuOpen = false; onRename() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Unpair", color = MaterialTheme.colorScheme.error) },
+                        onClick = { menuOpen = false; onUnpair() }
+                    )
+                }
             }
         }
     }
+}
+
+/**
+ * Lets the user pick a friendlier label for one Mac. Saving an empty field
+ * reverts to the name the Mac reported at pairing.
+ */
+@Composable
+private fun RenameMacDialog(
+    mac: MacStatus,
+    onConfirm: (String?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    // Start with the current label fully selected so typing replaces it.
+    var value by remember(mac.id) {
+        mutableStateOf(TextFieldValue(mac.name, selection = TextRange(0, mac.name.length)))
+    }
+    val focusRequester = remember { FocusRequester() }
+    val trimmed = value.text.trim()
+    val unchanged = trimmed == mac.name || (trimmed.isEmpty() && !mac.hasNickname)
+
+    LaunchedEffect(mac.id) { focusRequester.requestFocus() }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename Mac") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = {
+                        if (it.text.length <= PairedMac.MAX_NICKNAME_LENGTH && !it.text.contains('\n')) value = it
+                    },
+                    singleLine = true,
+                    label = { Text("Name") },
+                    placeholder = { Text(mac.macName) },
+                    supportingText = {
+                        Text(
+                            if (mac.hasNickname) "Leave empty to use “${mac.macName}” again."
+                            else "This name is only used on this phone."
+                        )
+                    },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { if (!unchanged) onConfirm(trimmed) }),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusRequester),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(trimmed) }, enabled = !unchanged) { Text("Save") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 @Composable

@@ -17,8 +17,8 @@ private func generateTestPublicKey() -> (privateKey: SecKey, publicKeyData: Data
     return (privateKey, publicKeyData)
 }
 
-private func makeStore() -> KeychainStore {
-    KeychainStore(service: "dev.touchbridge.test.pairing.\(UUID().uuidString)")
+private func makeStore() -> PairedDeviceStore {
+    makeTempDeviceStore()
 }
 
 // MARK: - Tests
@@ -27,7 +27,7 @@ private func makeStore() -> KeychainStore {
     let store = makeStore()
     defer { try? store.removeAll() }
 
-    let manager = PairingManager(keychainStore: store, macName: "Test Mac")
+    let manager = PairingManager(deviceStore: store, macName: "Test Mac")
     let qrData = try await manager.generatePairingQRData()
 
     let payload = try JSONDecoder().decode(PairingPayload.self, from: qrData)
@@ -41,7 +41,7 @@ private func makeStore() -> KeychainStore {
     let store = makeStore()
     defer { try? store.removeAll() }
 
-    let manager = PairingManager(keychainStore: store)
+    let manager = PairingManager(deviceStore: store)
 
     let qr1 = try await manager.generatePairingQRData()
     let payload1 = try JSONDecoder().decode(PairingPayload.self, from: qr1)
@@ -56,7 +56,7 @@ private func makeStore() -> KeychainStore {
     let store = makeStore()
     defer { try? store.removeAll() }
 
-    let manager = PairingManager(keychainStore: store)
+    let manager = PairingManager(deviceStore: store)
     let qrData = try await manager.generatePairingQRData()
     let payload = try JSONDecoder().decode(PairingPayload.self, from: qrData)
 
@@ -78,7 +78,7 @@ private func makeStore() -> KeychainStore {
     let store = makeStore()
     defer { try? store.removeAll() }
 
-    let manager = PairingManager(keychainStore: store)
+    let manager = PairingManager(deviceStore: store)
     _ = try await manager.generatePairingQRData()
 
     let (_, publicKeyData) = generateTestPublicKey()
@@ -99,7 +99,7 @@ private func makeStore() -> KeychainStore {
     defer { try? store.removeAll() }
 
     // Use 0 second expiry so token is immediately expired
-    let manager = PairingManager(keychainStore: store, tokenExpiry: 0)
+    let manager = PairingManager(deviceStore: store, tokenExpiry: 0)
     let qrData = try await manager.generatePairingQRData()
     let payload = try JSONDecoder().decode(PairingPayload.self, from: qrData)
 
@@ -120,7 +120,7 @@ private func makeStore() -> KeychainStore {
     let store = makeStore()
     defer { try? store.removeAll() }
 
-    let manager = PairingManager(keychainStore: store)
+    let manager = PairingManager(deviceStore: store)
     let (_, publicKeyData) = generateTestPublicKey()
 
     // No pairing session started
@@ -138,7 +138,7 @@ private func makeStore() -> KeychainStore {
     let store = makeStore()
     defer { try? store.removeAll() }
 
-    let manager = PairingManager(keychainStore: store)
+    let manager = PairingManager(deviceStore: store)
     let qrData = try await manager.generatePairingQRData()
     let payload = try JSONDecoder().decode(PairingPayload.self, from: qrData)
 
@@ -159,7 +159,7 @@ private func makeStore() -> KeychainStore {
     let store = makeStore()
     defer { try? store.removeAll() }
 
-    let manager = PairingManager(keychainStore: store)
+    let manager = PairingManager(deviceStore: store)
     let qrData = try await manager.generatePairingQRData()
     let payload = try JSONDecoder().decode(PairingPayload.self, from: qrData)
 
@@ -184,7 +184,7 @@ private func makeStore() -> KeychainStore {
     let store = makeStore()
     defer { try? store.removeAll() }
 
-    let manager = PairingManager(keychainStore: store)
+    let manager = PairingManager(deviceStore: store)
     let qrData = try await manager.generatePairingQRData()
     let payload = try JSONDecoder().decode(PairingPayload.self, from: qrData)
 
@@ -213,7 +213,7 @@ private func makeStore() -> KeychainStore {
     let store = makeStore()
     defer { try? store.removeAll() }
 
-    let manager = PairingManager(keychainStore: store)
+    let manager = PairingManager(deviceStore: store)
     _ = try await manager.generatePairingQRData()
 
     #expect(await manager.isPairingActive == true)
@@ -227,7 +227,7 @@ private func makeStore() -> KeychainStore {
     let store = makeStore()
     defer { try? store.removeAll() }
 
-    let manager = PairingManager(keychainStore: store)
+    let manager = PairingManager(deviceStore: store)
 
     // No pairing started
     #expect(await manager.isPairingActive == false)

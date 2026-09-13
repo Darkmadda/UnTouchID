@@ -21,7 +21,7 @@ cd daemon && swift test
 
 # Run specific test suite
 cd daemon && swift test --filter ChallengeManager
-cd daemon && swift test --filter Keychain
+cd daemon && swift test --filter PairedDeviceStore
 cd daemon && swift test --filter SocketServer
 cd daemon && swift test --filter PolicyEngine
 cd daemon && swift test --filter PAMIntegration
@@ -58,7 +58,7 @@ sudo echo 'TouchBridge works!'
 ## Project Structure
 
 - `daemon/` — Swift Package, macOS LaunchAgent daemon
-  - `Sources/TouchBridgeCore/` — testable library (ChallengeManager, KeychainStore, BLE, SocketServer, etc.)
+  - `Sources/TouchBridgeCore/` — testable library (ChallengeManager, PairedDeviceStore, BLE, SocketServer, etc.)
   - `Sources/touchbridged/` — daemon executable entry point
   - `Sources/touchbridge-test/` — CLI test harness
 - `protocol/` — shared Swift Package (message types, wire format, constants)

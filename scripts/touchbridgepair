@@ -1,0 +1,27 @@
+#!/bin/bash
+# Pair a companion device with TouchBridge.
+#
+# The daemon owns the BLE peripheral, so it must be stopped while pairing.
+# The restart runs from an EXIT trap so the daemon comes back even if pairing
+# fails, times out, or is interrupted with Ctrl-C.
+
+set -u
+
+LABEL="dev.touchbridge.daemon"
+DOMAIN="gui/$(id -u)"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+restart_daemon() {
+    if ! launchctl print "$DOMAIN/$LABEL" &>/dev/null; then
+        launchctl bootstrap "$DOMAIN" "$PLIST"
+    fi
+    # A bootstrap immediately after a bootout can leave the job registered but
+    # never launched (state "not running", runs = 0). Kickstart forces the
+    # launch; -k also restarts it if it is already running.
+    launchctl kickstart -k "$DOMAIN/$LABEL"
+}
+trap restart_daemon EXIT
+
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+
+touchbridge-test pair

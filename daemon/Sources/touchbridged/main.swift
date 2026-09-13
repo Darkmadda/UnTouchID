@@ -57,7 +57,10 @@ struct Serve: ParsableCommand {
         let policyEngine = PolicyEngine()
         let simulatorHandler = SimulatorAuthHandler(mode: mode)
 
-        let socketServer = SocketServer(authHandler: simulatorHandler, policyEngine: policyEngine)
+        // Responses are tagged mode=simulator. The PAM module ignores them
+        // unless the PAM line carries allow_mode=simulator — otherwise any
+        // same-user process could start this mode and sudo its way to root.
+        let socketServer = SocketServer(authHandler: simulatorHandler, policyEngine: policyEngine, mode: .simulator)
         do {
             try socketServer.start()
             print("  Socket: \(socketServer.path)")
@@ -67,6 +70,9 @@ struct Serve: ParsableCommand {
         }
 
         print("  Ready. Waiting for auth requests...")
+        print("")
+        print("  NOTE: pam_touchbridge only accepts simulator answers when its PAM line")
+        print("        includes allow_mode=simulator (see docs/setup.md).")
         print("")
 
         setupShutdownHandler {
@@ -95,7 +101,10 @@ struct Serve: ParsableCommand {
             Darwin.exit(1)
         }
 
-        let socketServer = SocketServer(authHandler: webHandler, policyEngine: policyEngine)
+        // Responses are tagged mode=web; the PAM module needs allow_mode=web
+        // to honour them (the approve URL is printed here, so a same-user
+        // process running this mode could approve its own requests).
+        let socketServer = SocketServer(authHandler: webHandler, policyEngine: policyEngine, mode: .web)
         do {
             try socketServer.start()
             print("  Socket: \(socketServer.path)")
@@ -103,6 +112,8 @@ struct Serve: ParsableCommand {
             print("")
             print("  Ready. Waiting for auth requests...")
             print("  When sudo runs, a URL will appear — open it on any phone to approve.")
+            print("  NOTE: pam_touchbridge only accepts web answers when its PAM line")
+            print("        includes allow_mode=web (see docs/setup.md).")
             print("")
         } catch {
             print("Error: Failed to start socket server: \(error)")

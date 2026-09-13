@@ -23,13 +23,13 @@ public struct PairingPayload: Codable, Sendable {
 /// Pairing flow:
 /// 1. Mac generates a `PairingPayload` with a random token, encodes to JSON for QR display
 /// 2. iPhone scans QR, connects via BLE, sends `PairRequestMessage` with its SE public key
-/// 3. Mac validates the token, stores the public key via `KeychainStore`
+/// 3. Mac validates the token, stores the public key via `PairedDeviceStore`
 /// 4. Mac responds with `PairResponseMessage(accepted: true)`
 /// 5. Pairing token expires after 5 minutes
 public actor PairingManager {
     private let logger = Logger(subsystem: "dev.touchbridge", category: "PairingManager")
 
-    private let keychainStore: KeychainStore
+    private let deviceStore: PairedDeviceStore
     private let macName: String
     private let serviceUUID: String
     private let tokenExpiry: TimeInterval
@@ -38,12 +38,12 @@ public actor PairingManager {
     private var activePairing: (token: Data, createdAt: Date)?
 
     public init(
-        keychainStore: KeychainStore,
+        deviceStore: PairedDeviceStore,
         macName: String? = nil,
         serviceUUID: String = TouchBridgeConstants.serviceUUID,
         tokenExpiry: TimeInterval = 300 // 5 minutes
     ) {
-        self.keychainStore = keychainStore
+        self.deviceStore = deviceStore
         self.macName = macName ?? Host.current().localizedName ?? "Mac"
         self.serviceUUID = serviceUUID
         self.tokenExpiry = tokenExpiry
@@ -141,9 +141,9 @@ public actor PairingManager {
         return device
     }
 
-    /// Complete the pairing by storing the device in the Keychain.
+    /// Complete the pairing by storing the device in the paired-device store.
     public func completePairing(device: PairedDevice) throws {
-        try keychainStore.storePairedDevice(device)
+        try deviceStore.storePairedDevice(device)
         activePairing = nil
         logger.info("Pairing completed for \(device.displayName) (\(device.deviceID))")
     }

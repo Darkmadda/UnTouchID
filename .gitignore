@@ -29,6 +29,7 @@ Package.resolved
 
 # Build artifacts
 pam/*.so
+pam/test_peer_verify
 
 # Secrets — never commit
 .env

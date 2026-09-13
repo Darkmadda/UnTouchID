@@ -11,8 +11,20 @@
 # Fallback (older macOS without the sudo_local include, e.g. Ventura): edit
 # /etc/pam.d/sudo directly, with a backup and confirmation, as before.
 #
-# /etc/pam.d/screensaver has no *_local equivalent, so it is always edited
-# directly.
+# The lock screen and GUI admin-prompt files have no *_local equivalent, so they
+# are always edited directly. macOS updates can rewrite them; re-running
+# install.sh or patch-pam.sh restores the hook.
+#
+# GUI admin prompts (System Settings, installers, any app using Authorization
+# Services) authenticate through a PAM service whose file name has moved across
+# macOS releases: it was `authorization` historically, and is `screensaver_new`
+# on macOS 26 (whose file still carries an `# authorization` header). We patch
+# every candidate that exists and carries a real opendirectory auth chain, so
+# the same installer works on both. Determined empirically with:
+#   sudo fs_usage -f filesys | grep pam.d   # while triggering an admin prompt
+# With the hook in place, leave the password field empty and click OK to approve
+# on the phone; typing a password skips the phone entirely.
+TB_GUI_ADMIN_FILES="screensaver_new authorization"
 #
 # TB_PAM_DIR overrides the PAM directory (defaults to /etc/pam.d) — used only
 # by the test harness; production callers leave it unset.
@@ -132,6 +144,19 @@ tb_enable_screensaver() {
     _tb_patch_pam_file "$TB_PAM_DIR/screensaver" "screensaver" "${1:-}"
 }
 
+# Enable the GUI admin-prompt hook. Patches every candidate service file that
+# exists and has a real opendirectory auth chain (see TB_GUI_ADMIN_FILES).
+tb_enable_gui_admin() {
+    local prompt="${1:-}" f patched=0
+    for f in $TB_GUI_ADMIN_FILES; do
+        if [ -f "$TB_PAM_DIR/$f" ] && grep -q "pam_opendirectory" "$TB_PAM_DIR/$f" 2>/dev/null; then
+            _tb_patch_pam_file "$TB_PAM_DIR/$f" "$f (GUI admin prompts)" "$prompt"
+            patched=1
+        fi
+    done
+    [ "$patched" = "1" ] || _tb_warn "No GUI admin-prompt PAM file found — skipping."
+}
+
 # Disable the sudo hook. Removes our sudo_local line (deleting the file if it
 # then holds nothing meaningful) AND undoes any legacy direct edit.
 tb_disable_sudo() {
@@ -155,4 +180,12 @@ tb_disable_sudo() {
 # Disable the screensaver hook.
 tb_disable_screensaver() {
     _tb_restore_pam_file "$TB_PAM_DIR/screensaver" "screensaver"
+}
+
+# Disable the GUI admin-prompt hook on every candidate file.
+tb_disable_gui_admin() {
+    local f
+    for f in $TB_GUI_ADMIN_FILES; do
+        _tb_restore_pam_file "$TB_PAM_DIR/$f" "$f (GUI admin prompts)"
+    done
 }

@@ -21,8 +21,7 @@ import CryptoKit
     let iosPublicKeyData = SecKeyCopyExternalRepresentation(iosPublicKey, &error)! as Data
 
     // "Mac side" stores the paired device
-    let keychainService = "dev.touchbridge.test.integration.\(UUID().uuidString)"
-    let store = KeychainStore(service: keychainService)
+    let store = makeTempDeviceStore()
     defer { try? store.removeAll() }
 
     let device = PairedDevice(

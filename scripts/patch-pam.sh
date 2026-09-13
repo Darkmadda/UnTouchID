@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # TouchBridge PAM Activator
-# Enables the TouchBridge PAM hook for sudo (and screensaver).
+# Enables the TouchBridge PAM hook for sudo, the lock screen (screensaver),
+# and GUI admin prompts (screensaver_new on macOS 26, authorization on older).
 # For users who installed via Homebrew or the .pkg — binaries are already in
 # place, this only activates the hook.
 #
@@ -35,6 +36,7 @@ _tb_info "Found PAM module: $PAM_LIB"
 
 tb_enable_sudo "prompt"
 tb_enable_screensaver "prompt"
+tb_enable_gui_admin "prompt"
 
 echo ""
 _tb_info "Done. Test with: sudo echo 'TouchBridge works!'"

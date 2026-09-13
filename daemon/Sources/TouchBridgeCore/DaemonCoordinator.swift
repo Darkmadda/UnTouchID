@@ -16,7 +16,7 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
     public let bleServer: any BLEServerInterface
     public let challengeManager: ChallengeManager
     public let pairingManager: PairingManager
-    public let keychainStore: KeychainStore
+    public let deviceStore: PairedDeviceStore
     public let auditLog: AuditLog
 
     /// Guards `sessions` and `pendingAuthentications` — both are mutated from
@@ -49,7 +49,7 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
     }
 
     public init(
-        keychainStore: KeychainStore = KeychainStore(),
+        deviceStore: PairedDeviceStore = PairedDeviceStore.standard(),
         auditLog: AuditLog = AuditLog(),
         challengeManager: ChallengeManager = ChallengeManager(),
         pairingManager: PairingManager? = nil,
@@ -57,12 +57,12 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
         serviceUUID: String = TouchBridgeConstants.serviceUUID,
         bleServer: (any BLEServerInterface)? = nil
     ) {
-        self.keychainStore = keychainStore
+        self.deviceStore = deviceStore
         self.auditLog = auditLog
         self.challengeManager = challengeManager
         self.bleServer = bleServer ?? BLEServer(rssiThreshold: rssiThreshold, serviceUUID: serviceUUID)
 
-        let pm = pairingManager ?? PairingManager(keychainStore: keychainStore, serviceUUID: serviceUUID)
+        let pm = pairingManager ?? PairingManager(deviceStore: deviceStore, serviceUUID: serviceUUID)
         self.pairingManager = pm
 
         super.init()
@@ -158,6 +158,26 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
     /// Broadcasts to every connected, paired device simultaneously.
     /// The first valid response wins — other challenges expire naturally.
     /// Blocks until a response arrives or the timeout expires.
+    /// Human-readable approval text shown on the companion for a PAM service.
+    /// Unknown services fall back to their raw name so nothing is hidden.
+    static func companionReason(for service: String) -> String {
+        switch service {
+        case "sudo":
+            return "sudo (administrator command)"
+        case "screensaver":
+            return "unlock this Mac"
+        // macOS GUI admin prompts: System Settings, installers, Authorization
+        // Services. The service file is screensaver_new on macOS 26,
+        // authorization on older releases.
+        case "screensaver_new", "authorization":
+            return "administrator access"
+        case "login":
+            return "log in to this Mac"
+        default:
+            return service
+        }
+    }
+
     public func authenticateFromPAM(
         user: String,
         service: String,
@@ -182,7 +202,11 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
             return (false, "no_companion_connected")
         }
 
-        logger.info("PAM auth: broadcasting challenge to \(targets.count) device(s)")
+        // The PAM service name reaches the companion as the approval reason. Raw
+        // names like "screensaver_new" (the macOS 26 GUI admin-prompt service)
+        // are cryptic on the phone, so map the known ones to plain language.
+        let challengeReason = Self.companionReason(for: service)
+        logger.info("PAM auth: broadcasting challenge to \(targets.count) device(s) reason=\(challengeReason)")
 
         // Race: first device response OR global timeout — whichever fires first wins.
         //
@@ -205,7 +229,7 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
             Task {
                 var issued = 0
                 for centralID in targets {
-                    if let challengeID = await self.issueChallenge(to: centralID, reason: service) {
+                    if let challengeID = await self.issueChallenge(to: centralID, reason: challengeReason) {
                         self.stateLock.withLock {
                             self.pendingAuthentications[challengeID] = wrapped
                         }
@@ -256,14 +280,6 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
     public var readyCentrals: [UUID] {
         stateLock.withLock {
             sessions.filter { $0.value.sessionCrypto != nil }.map(\.key)
-        }
-    }
-
-    /// Get all connected centrals that are both encrypted and recognised as a
-    /// previously paired device, so they can receive challenges.
-    public var identifiedCentrals: [UUID] {
-        stateLock.withLock {
-            sessions.filter { $0.value.sessionCrypto != nil && $0.value.deviceID != nil }.map(\.key)
         }
     }
 }
@@ -418,7 +434,7 @@ extension DaemonCoordinator: BLEServerDelegate {
                     return
                 }
 
-                let publicKey = try keychainStore.retrievePublicKey(for: response.deviceID)
+                let publicKey = try deviceStore.retrievePublicKey(for: response.deviceID)
                 let startTime = Date()
 
                 let result = await challengeManager.verify(
@@ -487,8 +503,13 @@ extension DaemonCoordinator: BLEServerDelegate {
         let msg = try WireFormat.decodePayload(IdentifyMessage.self, from: plaintext)
 
         // Verify this device is actually in the keychain (was paired at some point).
-        guard (try? keychainStore.retrievePairedDevice(deviceID: msg.deviceID)) != nil else {
+        do {
+            _ = try deviceStore.retrievePairedDevice(deviceID: msg.deviceID)
+        } catch PairedDeviceStoreError.deviceNotFound {
             logger.warning("Identify from \(centralID): unknown deviceID \(msg.deviceID) — ignoring")
+            return
+        } catch {
+            logger.error("Identify from \(centralID): paired-device store unreadable (\(String(describing: error))) — ignoring")
             return
         }
 

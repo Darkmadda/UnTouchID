@@ -57,6 +57,24 @@ private func cleanup(_ dir: URL) {
     #expect(pol.mode == .biometricRequired)
 }
 
+@Test func defaultAuthorizationPolicyRequiresBiometric() {
+    // GUI admin prompts (System Settings, installers) grant admin rights, so
+    // they get the same treatment as sudo. The PAM service is "authorization"
+    // on older macOS and "screensaver_new" on macOS 26.
+    let engine = PolicyEngine(plistPath: "/nonexistent/policy.plist")
+    #expect(engine.policy(for: "authorization").mode == .biometricRequired)
+    #expect(engine.policy(for: "screensaver_new").mode == .biometricRequired)
+}
+
+@Test func companionReasonMapsGuiAdminServices() {
+    // The phone should show plain language, not raw PAM service names.
+    #expect(DaemonCoordinator.companionReason(for: "screensaver_new") == "administrator access")
+    #expect(DaemonCoordinator.companionReason(for: "authorization") == "administrator access")
+    #expect(DaemonCoordinator.companionReason(for: "sudo") == "sudo (administrator command)")
+    // Unknown services pass through unchanged.
+    #expect(DaemonCoordinator.companionReason(for: "custom_thing") == "custom_thing")
+}
+
 @Test func defaultScreensaverPolicyIsProximitySession() {
     let engine = PolicyEngine(plistPath: "/nonexistent")
     let pol = engine.policy(for: "screensaver")

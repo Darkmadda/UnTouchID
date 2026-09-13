@@ -56,6 +56,7 @@ fi
 
 tb_disable_sudo
 tb_disable_screensaver
+tb_disable_gui_admin
 
 # --- Remove Binaries ---
 

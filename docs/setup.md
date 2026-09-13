@@ -61,7 +61,7 @@ brew install --cask touchbridge
 This installs:
 - `touchbridged` — the daemon that runs in the background
 - `touchbridge-test` — CLI for pairing, logs, and config
-- `pam_touchbridge.so` — the PAM module that hooks into `sudo`
+- `pam_touchbridge.so` — the PAM module that hooks into `sudo`, the lock screen, and GUI admin prompts
 - The LaunchAgent that auto-starts the daemon at login
 
 **After installation, patch sudo:**
@@ -86,6 +86,39 @@ sudo bash patch-pam.sh
 ```
 
 This shows you exactly what will change and asks for confirmation before touching any PAM file.
+
+It offers three hooks:
+
+| PAM service | What it covers | File |
+|-------------|----------------|------|
+| `sudo` | Terminal `sudo` | `/etc/pam.d/sudo_local` (Sonoma+) |
+| `screensaver` | Lock screen unlock | `/etc/pam.d/screensaver` |
+| `authorization` (GUI admin) | GUI admin prompts: System Settings, installers, any app that asks for an administrator password | `/etc/pam.d/screensaver_new` on macOS 26, `/etc/pam.d/authorization` on older |
+
+### GUI admin prompts (System Settings, installers)
+
+On macOS 26 the admin-prompt PAM service moved into `/etc/pam.d/screensaver_new`
+(its file still carries an `# authorization` header); older macOS uses
+`/etc/pam.d/authorization`. `install.sh` and `patch-pam.sh` patch whichever
+exists. To confirm which file your macOS uses, run
+`sudo fs_usage -f filesys | grep pam.d` while triggering an admin prompt.
+
+With the hook enabled, when macOS shows an administrator password dialog:
+
+- **Leave the password field empty and click OK (or press Return).** The
+  phone prompts for Face ID / fingerprint; approve and the dialog closes.
+- **Type your password as usual** and the phone is never contacted — the
+  module steps aside as soon as it sees a password was entered. The same is
+  true at the lock screen.
+
+The dialog does not know about TouchBridge, so it shows no "check your
+phone" hint; it simply waits (up to the auth timeout, default 15 s) while the
+phone prompt is up. If the phone denies or times out, the dialog reports an
+incorrect password and you can type it instead.
+
+macOS updates sometimes rewrite `/etc/pam.d/screensaver`, `screensaver_new`,
+and `authorization`. If the phone stops prompting for those surfaces after an
+update, re-run `patch-pam.sh` (or `install.sh`); both are idempotent.
 
 ---
 
@@ -333,6 +366,20 @@ Both Mac and phone must be on the **same Wi-Fi network**.
 
 Auto-approves all auth requests using software keys.
 
+> **Root opt-in required.** Because the simulator approves without a phone,
+> any process running as you could start one and use it to become root
+> through `sudo`. The PAM module therefore ignores simulator (and web) answers
+> unless root has explicitly allowed them on the TouchBridge PAM line. On a
+> development machine, add `allow_mode=simulator` (Sonoma+: in
+> `/etc/pam.d/sudo_local`; the same option works for `allow_mode=web`):
+>
+> ```bash
+> sudo sed -i '' 's|pam_touchbridge.so$|pam_touchbridge.so allow_mode=simulator|' /etc/pam.d/sudo_local
+> ```
+>
+> Remove it again when you are done. Without it, simulator answers are logged
+> and refused, and `sudo` falls through to your password.
+
 ```bash
 # Stop the normal daemon
 launchctl bootout gui/$(id -u)/dev.touchbridge.daemon 2>/dev/null
@@ -410,6 +457,8 @@ TouchBridge Policy Configuration
 Surface Policies:
   sudo:             biometric required
   screensaver:      proximity session (30 min)
+  authorization:    biometric required
+  screensaver_new:  biometric required
   app_store:        biometric required
   system_settings:  biometric required
   browser_autofill: proximity session (10 min)

@@ -1,4 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <style name="Theme.TouchBridge" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!-- No-chrome theme for ChallengeActivity: it only hosts the system
+         biometric prompt, so the window itself stays invisible. -->
+    <style name="Theme.TouchBridge.Transparent" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
 </resources>

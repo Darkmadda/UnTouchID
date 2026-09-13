@@ -20,7 +20,7 @@ import CryptoKit
 /// with a mock companion device.
 final class FullFlowAuthHandler: PAMAuthHandler, @unchecked Sendable {
     let challengeManager = ChallengeManager()
-    let keychainStore: KeychainStore
+    let deviceStore: PairedDeviceStore
     let auditLog: AuditLog
 
     // Simulated companion device
@@ -28,8 +28,8 @@ final class FullFlowAuthHandler: PAMAuthHandler, @unchecked Sendable {
     let companionPublicKey: SecKey
     let deviceID: String
 
-    init(keychainService: String) {
-        self.keychainStore = KeychainStore(service: keychainService)
+    init() {
+        self.deviceStore = makeTempDeviceStore()
         let logDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("tb-e2e-\(UUID().uuidString)")
         self.auditLog = AuditLog(logDirectory: logDir)
@@ -53,7 +53,7 @@ final class FullFlowAuthHandler: PAMAuthHandler, @unchecked Sendable {
             displayName: "E2E Test iPhone",
             pairedAt: Date()
         )
-        try! keychainStore.storePairedDevice(device)
+        try! deviceStore.storePairedDevice(device)
     }
 
     func authenticateFromPAM(user: String, service: String, pid: Int, timeout: TimeInterval) async -> (success: Bool, reason: String?) {
@@ -79,7 +79,7 @@ final class FullFlowAuthHandler: PAMAuthHandler, @unchecked Sendable {
 
         // 3. Verify the signature
         do {
-            let publicKey = try keychainStore.retrievePublicKey(for: deviceID)
+            let publicKey = try deviceStore.retrievePublicKey(for: deviceID)
             let result = await challengeManager.verify(
                 challengeID: challenge.id,
                 signature: signature,
@@ -105,7 +105,7 @@ final class FullFlowAuthHandler: PAMAuthHandler, @unchecked Sendable {
     }
 
     func cleanup() {
-        try? keychainStore.removeAll()
+        try? deviceStore.removeAll()
     }
 }
 
@@ -154,7 +154,7 @@ private func pamConnect(socketPath: String, user: String, service: String) throw
 /// so signature verification always returns .invalidSignature.
 final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
     let challengeManager = ChallengeManager()
-    let keychainStore: KeychainStore
+    let deviceStore: PairedDeviceStore
     let auditLog: AuditLog
     let deviceID: String
 
@@ -163,8 +163,8 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
     // A different key used to sign — deliberately wrong
     private let wrongPrivateKey: SecKey
 
-    init(keychainService: String) {
-        self.keychainStore = KeychainStore(service: keychainService)
+    init() {
+        self.deviceStore = makeTempDeviceStore()
         let logDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("tb-e2e-bad-\(UUID().uuidString)")
         self.auditLog = AuditLog(logDirectory: logDir)
@@ -190,7 +190,7 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
             displayName: "Bad Sig iPhone",
             pairedAt: Date()
         )
-        try! keychainStore.storePairedDevice(device)
+        try! deviceStore.storePairedDevice(device)
     }
 
     func authenticateFromPAM(user: String, service: String, pid: Int, timeout: TimeInterval) async -> (success: Bool, reason: String?) {
@@ -212,7 +212,7 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
         }
 
         do {
-            let publicKey = try keychainStore.retrievePublicKey(for: deviceID)
+            let publicKey = try deviceStore.retrievePublicKey(for: deviceID)
             let result = await challengeManager.verify(
                 challengeID: challenge.id,
                 signature: signature,
@@ -235,7 +235,7 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
     }
 
     func cleanup() {
-        try? keychainStore.removeAll()
+        try? deviceStore.removeAll()
     }
 }
 
@@ -245,8 +245,7 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
     let socketPath = makeShortSocketPath()
     defer { unlink(socketPath) }
 
-    let keychainService = "dev.touchbridge.test.e2e.\(UUID().uuidString)"
-    let handler = FullFlowAuthHandler(keychainService: keychainService)
+    let handler = FullFlowAuthHandler()
     defer { handler.cleanup() }
 
     let server = SocketServer(authHandler: handler, socketPath: socketPath)
@@ -272,8 +271,7 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
     let socketPath = makeShortSocketPath()
     defer { unlink(socketPath) }
 
-    let keychainService = "dev.touchbridge.test.e2e.\(UUID().uuidString)"
-    let handler = FullFlowAuthHandler(keychainService: keychainService)
+    let handler = FullFlowAuthHandler()
     defer { handler.cleanup() }
 
     let server = SocketServer(authHandler: handler, socketPath: socketPath)
@@ -294,8 +292,7 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
     let socketPath = makeShortSocketPath()
     defer { unlink(socketPath) }
 
-    let keychainService = "dev.touchbridge.test.e2e.\(UUID().uuidString)"
-    let handler = FullFlowAuthHandler(keychainService: keychainService)
+    let handler = FullFlowAuthHandler()
     defer { handler.cleanup() }
 
     let server = SocketServer(authHandler: handler, socketPath: socketPath)
@@ -319,8 +316,7 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
     let socketPath = makeShortSocketPath()
     defer { unlink(socketPath) }
 
-    let keychainService = "dev.touchbridge.test.e2e.\(UUID().uuidString)"
-    let handler = FullFlowAuthHandler(keychainService: keychainService)
+    let handler = FullFlowAuthHandler()
     defer { handler.cleanup() }
 
     let server = SocketServer(authHandler: handler, socketPath: socketPath)
@@ -343,8 +339,7 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
     let socketPath = makeShortSocketPath()
     defer { unlink(socketPath) }
 
-    let keychainService = "dev.touchbridge.test.e2e.\(UUID().uuidString)"
-    let handler = BadSignatureAuthHandler(keychainService: keychainService)
+    let handler = BadSignatureAuthHandler()
     defer { handler.cleanup() }
 
     let server = SocketServer(authHandler: handler, socketPath: socketPath)
@@ -366,8 +361,7 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
     let socketPath = makeShortSocketPath()
     defer { unlink(socketPath) }
 
-    let keychainService = "dev.touchbridge.test.e2e.\(UUID().uuidString)"
-    let handler = FullFlowAuthHandler(keychainService: keychainService)
+    let handler = FullFlowAuthHandler()
     defer { handler.cleanup() }
 
     let server = SocketServer(authHandler: handler, socketPath: socketPath)
@@ -401,8 +395,7 @@ final class BadSignatureAuthHandler: PAMAuthHandler, @unchecked Sendable {
     let socketPath = makeShortSocketPath()
     defer { unlink(socketPath) }
 
-    let keychainService = "dev.touchbridge.test.e2e.\(UUID().uuidString)"
-    let handler = FullFlowAuthHandler(keychainService: keychainService)
+    let handler = FullFlowAuthHandler()
     defer { handler.cleanup() }
 
     let server = SocketServer(authHandler: handler, socketPath: socketPath)

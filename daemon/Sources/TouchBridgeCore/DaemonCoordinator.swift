@@ -16,7 +16,7 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
     public let bleServer: any BLEServerInterface
     public let challengeManager: ChallengeManager
     public let pairingManager: PairingManager
-    public let keychainStore: KeychainStore
+    public let deviceStore: PairedDeviceStore
     public let auditLog: AuditLog
 
     /// Guards `sessions` and `pendingAuthentications` — both are mutated from
@@ -49,7 +49,7 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
     }
 
     public init(
-        keychainStore: KeychainStore = KeychainStore(),
+        deviceStore: PairedDeviceStore = PairedDeviceStore.standard(),
         auditLog: AuditLog = AuditLog(),
         challengeManager: ChallengeManager = ChallengeManager(),
         pairingManager: PairingManager? = nil,
@@ -57,12 +57,12 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
         serviceUUID: String = TouchBridgeConstants.serviceUUID,
         bleServer: (any BLEServerInterface)? = nil
     ) {
-        self.keychainStore = keychainStore
+        self.deviceStore = deviceStore
         self.auditLog = auditLog
         self.challengeManager = challengeManager
         self.bleServer = bleServer ?? BLEServer(rssiThreshold: rssiThreshold, serviceUUID: serviceUUID)
 
-        let pm = pairingManager ?? PairingManager(keychainStore: keychainStore, serviceUUID: serviceUUID)
+        let pm = pairingManager ?? PairingManager(deviceStore: deviceStore, serviceUUID: serviceUUID)
         self.pairingManager = pm
 
         super.init()
@@ -434,7 +434,7 @@ extension DaemonCoordinator: BLEServerDelegate {
                     return
                 }
 
-                let publicKey = try keychainStore.retrievePublicKey(for: response.deviceID)
+                let publicKey = try deviceStore.retrievePublicKey(for: response.deviceID)
                 let startTime = Date()
 
                 let result = await challengeManager.verify(
@@ -503,8 +503,13 @@ extension DaemonCoordinator: BLEServerDelegate {
         let msg = try WireFormat.decodePayload(IdentifyMessage.self, from: plaintext)
 
         // Verify this device is actually in the keychain (was paired at some point).
-        guard (try? keychainStore.retrievePairedDevice(deviceID: msg.deviceID)) != nil else {
+        do {
+            _ = try deviceStore.retrievePairedDevice(deviceID: msg.deviceID)
+        } catch PairedDeviceStoreError.deviceNotFound {
             logger.warning("Identify from \(centralID): unknown deviceID \(msg.deviceID) — ignoring")
+            return
+        } catch {
+            logger.error("Identify from \(centralID): paired-device store unreadable (\(String(describing: error))) — ignoring")
             return
         }
 

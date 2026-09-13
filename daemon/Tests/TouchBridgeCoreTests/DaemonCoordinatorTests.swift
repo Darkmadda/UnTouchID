@@ -237,17 +237,17 @@ final class CompanionSimulator: @unchecked Sendable {
 private func makeTestCoordinator() -> (
     coordinator: DaemonCoordinator,
     bleServer: MockBLEServer,
-    keychain: KeychainStore,
+    keychain: PairedDeviceStore,
     auditLog: AuditLog
 ) {
     let bleServer = MockBLEServer()
-    let keychain = KeychainStore(service: "dev.touchbridge.test.\(UUID().uuidString)")
+    let keychain = makeTempDeviceStore()
     let logDir = FileManager.default.temporaryDirectory
         .appendingPathComponent("tb-test-\(UUID().uuidString)")
     let auditLog = AuditLog(logDirectory: logDir)
 
     let coordinator = DaemonCoordinator(
-        keychainStore: keychain,
+        deviceStore: keychain,
         auditLog: auditLog,
         bleServer: bleServer
     )
@@ -255,7 +255,7 @@ private func makeTestCoordinator() -> (
 }
 
 /// Register a companion's signing key in the keychain so `identify` and auth work.
-private func register(_ companion: CompanionSimulator, in keychain: KeychainStore) throws {
+private func register(_ companion: CompanionSimulator, in keychain: PairedDeviceStore) throws {
     let device = PairedDevice(
         deviceID: companion.deviceID,
         publicKey: companion.signingPublicKeyData,
@@ -834,18 +834,18 @@ enum TestSetupError: Error { case ecdhFailed }
 private func makePairingTestCoordinator() -> (
     coordinator: DaemonCoordinator,
     bleServer: MockBLEServer,
-    keychain: KeychainStore,
+    keychain: PairedDeviceStore,
     pairingManager: PairingManager
 ) {
     let bleServer = MockBLEServer()
-    let keychain = KeychainStore(service: "dev.touchbridge.test.\(UUID().uuidString)")
+    let keychain = makeTempDeviceStore()
     let logDir = FileManager.default.temporaryDirectory
         .appendingPathComponent("tb-test-\(UUID().uuidString)")
     let auditLog = AuditLog(logDirectory: logDir)
-    let pairingManager = PairingManager(keychainStore: keychain)
+    let pairingManager = PairingManager(deviceStore: keychain)
 
     let coordinator = DaemonCoordinator(
-        keychainStore: keychain,
+        deviceStore: keychain,
         auditLog: auditLog,
         pairingManager: pairingManager,
         bleServer: bleServer

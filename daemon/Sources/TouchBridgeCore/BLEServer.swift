@@ -110,16 +110,16 @@ public class BLEServer: NSObject, BLEServerInterface {
 
     public weak var delegate: BLEServerDelegate?
 
+    /// Advertising intent vs. what the Bluetooth stack is actually doing.
+    /// Kept separate from CoreBluetooth so the resume-after-power-cycle logic
+    /// is unit-testable without hardware.
+    private var advertising = BLEAdvertisingState()
+
     /// Whether the peripheral manager is powered on and ready.
-    public private(set) var isReady: Bool = false
+    public var isReady: Bool { advertising.isReady }
 
     /// Whether we are currently advertising.
-    public private(set) var isAdvertising: Bool = false
-
-    /// Set when advertising is requested before Bluetooth is powered on, so we
-    /// can start as soon as it becomes ready instead of losing the one attempt
-    /// to a startup race (Bluetooth can take >1s to power on after launch).
-    private var shouldAdvertiseWhenReady: Bool = false
+    public var isAdvertising: Bool { advertising.isAdvertising }
 
     public init(
         rssiThreshold: Int = TouchBridgeConstants.defaultRSSIThreshold,
@@ -135,31 +135,34 @@ public class BLEServer: NSObject, BLEServerInterface {
 
     /// Start advertising the TouchBridge BLE service.
     ///
-    /// If called before Bluetooth is powered on, the request is deferred and
-    /// fulfilled automatically once the peripheral manager reports poweredOn —
-    /// so a slow Bluetooth stack at launch never silently drops advertising.
+    /// This records the *intent* to advertise, which survives Bluetooth power
+    /// cycles: if the stack is not powered on yet (slow start-up), or later
+    /// powers off and back on (idle, sleep/wake), advertising is (re)started
+    /// automatically as soon as the peripheral manager reports poweredOn.
     public func startAdvertising() {
-        if isAdvertising { return }
-        guard isReady else {
-            shouldAdvertiseWhenReady = true
+        switch advertising.requestStart() {
+        case .startStack:
+            startStackAdvertising()
+        case .deferUntilReady:
             logger.info("Advertising requested before Bluetooth ready — deferring until poweredOn")
-            return
+        case .noop:
+            break
         }
+    }
 
+    /// Stop advertising and clear the intent so a later power cycle does not resume it.
+    public func stopAdvertising() {
+        guard advertising.requestStop() else { return }
+        peripheralManager.stopAdvertising()
+        logger.info("Stopped advertising")
+    }
+
+    private func startStackAdvertising() {
         peripheralManager.startAdvertising([
             CBAdvertisementDataServiceUUIDsKey: [CBUUID(string: serviceUUID)],
             CBAdvertisementDataLocalNameKey: "TouchBridge",
         ])
-        isAdvertising = true
         logger.info("Started advertising TouchBridge service")
-    }
-
-    /// Stop advertising.
-    public func stopAdvertising() {
-        guard isAdvertising else { return }
-        peripheralManager.stopAdvertising()
-        isAdvertising = false
-        logger.info("Stopped advertising")
     }
 
     /// Send an encrypted challenge to a specific connected central.
@@ -266,8 +269,23 @@ public class BLEServer: NSObject, BLEServerInterface {
         svc.characteristics = [sessionKeyChar!, challengeChar!, responseChar!, pairingChar!]
         service = svc
 
+        // The stack forgets our services on power-off, but re-adding without
+        // removing first would register a duplicate if it did not.
+        peripheralManager.removeAllServices()
         peripheralManager.add(svc)
         logger.info("TouchBridge GATT service registered")
+    }
+
+    /// Bluetooth went away underneath us: every link is gone, and CoreBluetooth
+    /// will not deliver unsubscribe callbacks for them.
+    private func dropAllCentrals(reason: String) {
+        guard !connectedCentrals.isEmpty else { return }
+        let ids = Array(connectedCentrals.keys)
+        connectedCentrals.removeAll()
+        logger.info("Dropping \(ids.count) central(s): \(reason)")
+        for id in ids {
+            delegate?.bleServer(self, centralDidDisconnect: id)
+        }
     }
 
     private func routeWrite(for characteristicUUID: CBUUID, data: Data, centralID: UUID) {
@@ -296,26 +314,31 @@ extension BLEServer: CBPeripheralManagerDelegate {
         switch peripheral.state {
         case .poweredOn:
             logger.info("Bluetooth powered on")
-            isReady = true
+            // Services and advertising do not survive a power cycle; rebuild
+            // both. This is also the first-launch path.
             buildService()
-            // Fulfil any advertising request that arrived before we were ready.
-            if shouldAdvertiseWhenReady {
-                shouldAdvertiseWhenReady = false
-                startAdvertising()
+            if advertising.stackPoweredOn() {
+                startStackAdvertising()
             }
         case .poweredOff:
             logger.warning("Bluetooth powered off")
-            isReady = false
-            isAdvertising = false
+            advertising.stackUnavailable()
+            dropAllCentrals(reason: "Bluetooth powered off")
+        case .resetting:
+            logger.warning("Bluetooth resetting")
+            advertising.stackUnavailable()
+            dropAllCentrals(reason: "Bluetooth resetting")
         case .unauthorized:
             logger.error("Bluetooth unauthorized — check Info.plist NSBluetoothAlwaysUsageDescription")
-            isReady = false
+            advertising.stackUnavailable()
+            dropAllCentrals(reason: "Bluetooth unauthorized")
         case .unsupported:
             logger.error("Bluetooth not supported on this hardware")
-            isReady = false
+            advertising.stackUnavailable()
         default:
             logger.info("Bluetooth state: \(String(describing: peripheral.state.rawValue))")
-            isReady = false
+            advertising.stackUnavailable()
+            dropAllCentrals(reason: "Bluetooth unavailable")
         }
     }
 
@@ -337,7 +360,7 @@ extension BLEServer: CBPeripheralManagerDelegate {
     ) {
         if let error {
             logger.error("Failed to start advertising: \(error.localizedDescription)")
-            isAdvertising = false
+            advertising.stackRejectedStart()
         } else {
             logger.info("Advertising started")
         }
@@ -430,5 +453,72 @@ extension BLEServer: CBPeripheralManagerDelegate {
         // Called when the transmit queue has space again after a failed updateValue.
         // In a production implementation, we'd retry queued notifications here.
         logger.info("Transmit queue ready for more notifications")
+    }
+}
+
+// MARK: - Advertising State Machine
+
+/// Tracks the daemon's *intent* to advertise separately from whether the
+/// Bluetooth stack is currently advertising.
+///
+/// macOS turns the Bluetooth controller off and on while the Mac is idle or
+/// asleep. Every power-off silently ends advertising, so the intent has to be
+/// re-applied on every powered-on transition, not just the first one. This
+/// struct is pure so that logic can be tested without CoreBluetooth.
+struct BLEAdvertisingState: Equatable {
+    /// The daemon wants to be advertising (set by start, cleared by stop).
+    private(set) var wantsAdvertising = false
+    /// The stack reports poweredOn.
+    private(set) var isReady = false
+    /// We have asked the stack to advertise and it has not gone away since.
+    private(set) var isAdvertising = false
+
+    enum StartAction: Equatable {
+        /// Call the stack's startAdvertising now.
+        case startStack
+        /// Bluetooth is not ready; will start on the next poweredOn.
+        case deferUntilReady
+        /// Already advertising (or already deferred) — nothing to do.
+        case noop
+    }
+
+    /// Record the intent to advertise and say what the caller must do now.
+    mutating func requestStart() -> StartAction {
+        wantsAdvertising = true
+        guard isReady else { return .deferUntilReady }
+        guard !isAdvertising else { return .noop }
+        isAdvertising = true
+        return .startStack
+    }
+
+    /// Clear the intent. Returns true if the caller must tell the stack to stop.
+    mutating func requestStop() -> Bool {
+        wantsAdvertising = false
+        guard isAdvertising else { return false }
+        isAdvertising = false
+        return true
+    }
+
+    /// The stack reported poweredOn. Returns true if the caller must start
+    /// advertising on the stack (i.e. the intent is set).
+    mutating func stackPoweredOn() -> Bool {
+        isReady = true
+        // Whatever we were doing before did not survive the power cycle.
+        isAdvertising = false
+        guard wantsAdvertising else { return false }
+        isAdvertising = true
+        return true
+    }
+
+    /// The stack reported any state other than poweredOn: nothing we set up
+    /// is still live, but the intent is kept for the next poweredOn.
+    mutating func stackUnavailable() {
+        isReady = false
+        isAdvertising = false
+    }
+
+    /// The stack refused our startAdvertising call.
+    mutating func stackRejectedStart() {
+        isAdvertising = false
     }
 }

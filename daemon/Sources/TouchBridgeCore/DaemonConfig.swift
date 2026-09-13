@@ -24,8 +24,7 @@ public struct DaemonConfig: Sendable {
     /// Always succeeds — falls back to the shared constant if the config
     /// directory is somehow unwritable (e.g. sandboxed test environment).
     public static func load() -> DaemonConfig {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let dir = "\(home)/Library/Application Support/TouchBridge"
+        let dir = TouchBridgePaths.supportDirectory.path
         let path = "\(dir)/\(filename)"
 
         if let data = FileManager.default.contents(atPath: path),
@@ -55,5 +54,14 @@ public struct DaemonConfig: Sendable {
 
     private init(serviceUUID: String) {
         self.serviceUUID = serviceUUID
+    }
+}
+
+/// Where TouchBridge keeps its per-user state on this Mac.
+public enum TouchBridgePaths {
+    /// `~/Library/Application Support/TouchBridge`
+    public static var supportDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/TouchBridge", isDirectory: true)
     }
 }

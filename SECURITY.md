@@ -106,7 +106,7 @@ osascript -e 'do shell script "cp /tmp/tb-x/Payload/usr/local/lib/pam/pam_touchb
 | Replay protection | Seen-nonces ring buffer, 60-second TTL |
 | Signing algorithm | ECDSA P-256 (`ecdsaSignatureMessageX962SHA256`) |
 | Key storage (iOS) | Secure Enclave (`kSecAttrTokenIDSecureEnclave`) |
-| Key storage (Mac) | Keychain (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`) |
+| Key storage (Mac) | Companion *public* keys only, in `~/Library/Application Support/TouchBridge/paired-devices.json` (mode 0600) |
 | Session encryption | AES-256-GCM over ECDH-derived key (HKDF-SHA256) |
 | Transport | BLE GATT (encrypted) or local Wi-Fi (Bonjour) |
 

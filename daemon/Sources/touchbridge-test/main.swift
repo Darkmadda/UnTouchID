@@ -52,14 +52,14 @@ struct PairCommand: ParsableCommand {
     var timeout: Int = 300
 
     func run() throws {
-        let keychainStore = KeychainStore()
+        let deviceStore = PairedDeviceStore.standard()
         // Use the daemon's per-Mac service UUID so the printed payload and this
         // process's advertisement match what the installed daemon advertises —
         // otherwise the companion pairs against a UUID it can never find again.
         let config = DaemonConfig.load()
-        let pairingManager = PairingManager(keychainStore: keychainStore, serviceUUID: config.serviceUUID)
+        let pairingManager = PairingManager(deviceStore: deviceStore, serviceUUID: config.serviceUUID)
         let coordinator = DaemonCoordinator(
-            keychainStore: keychainStore,
+            deviceStore: deviceStore,
             pairingManager: pairingManager,
             serviceUUID: config.serviceUUID
         )
@@ -177,11 +177,11 @@ struct ChallengeCommand: ParsableCommand {
     var timeout: Int = 30
 
     func run() throws {
-        let keychainStore = KeychainStore()
+        let deviceStore = PairedDeviceStore.standard()
 
         // Verify the device is paired
         do {
-            let pairedDevice = try keychainStore.retrievePairedDevice(deviceID: device)
+            let pairedDevice = try deviceStore.retrievePairedDevice(deviceID: device)
             print("Challenging paired device: \(pairedDevice.displayName) (\(device))")
         } catch {
             print("Error: Device '\(device)' is not paired.")
@@ -190,7 +190,7 @@ struct ChallengeCommand: ParsableCommand {
         }
 
         let coordinator = DaemonCoordinator(
-            keychainStore: keychainStore,
+            deviceStore: deviceStore,
             serviceUUID: DaemonConfig.load().serviceUUID
         )
         let challengeResult = Locked<ChallengeResult?>(nil)
@@ -284,7 +284,7 @@ struct ListDevicesCommand: ParsableCommand {
     )
 
     func run() throws {
-        let store = KeychainStore()
+        let store = PairedDeviceStore.standard()
 
         let devices = try store.listPairedDevices()
 

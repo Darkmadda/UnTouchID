@@ -15,7 +15,7 @@
 ### Pairing (one-time)
 - iPhone generates ECDSA P-256 key in Secure Enclave
 - Public key transferred to Mac via BLE during QR pairing ceremony
-- Mac stores public key in Keychain tagged with device UUID
+- Mac stores the public key (never a secret) in `~/Library/Application Support/TouchBridge/paired-devices.json`, keyed by device UUID. The Keychain is deliberately not used: its per-application ACLs are keyed on the code hash, which changes for every ad-hoc build, so securityd prompted on each reinstall and silently denied the daemon when nobody was there to answer.
 
 ### Per-Session (ECDH)
 - Each BLE connection establishes ephemeral P-256 key pair on both sides

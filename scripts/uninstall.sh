@@ -67,6 +67,12 @@ else
     info "Daemon binary not found — skipping."
 fi
 
+AUTOLOCK_TOOL="/usr/local/bin/touchbridge-autolock"
+if [ -f "$AUTOLOCK_TOOL" ]; then
+    rm -f "$AUTOLOCK_TOOL"
+    info "Removed $AUTOLOCK_TOOL"
+fi
+
 if [ -f "$PAM_LIB" ]; then
     rm -f "$PAM_LIB"
     info "Removed $PAM_LIB"

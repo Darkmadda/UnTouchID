@@ -485,12 +485,24 @@ touchbridge-test config reset
 Lock your Mac automatically when your phone goes out of BLE range:
 
 ```bash
-touchbridged serve --auto-lock
+# Turn it on for the installed daemon (no sudo needed)
+touchbridge-autolock on
+
+# Lock 60 seconds after the phone disconnects instead of the default 30
+touchbridge-autolock on --delay 60
+
+# Check or turn off
+touchbridge-autolock status
+touchbridge-autolock off
 ```
 
-If your phone disconnects for 30 seconds, the screen locks. Walk back in range — everything resumes.
+`touchbridge-autolock` edits the LaunchAgent (`~/Library/LaunchAgents/dev.touchbridge.daemon.plist`) and restarts the daemon, so the change takes effect immediately and survives reboots. It's installed to `/usr/local/bin` by `install.sh`; the same script lives at `scripts/touchbridge-autolock` in the repo.
 
-To make this permanent, edit `~/Library/LaunchAgents/dev.touchbridge.daemon.plist` and add `--auto-lock` to the `ProgramArguments` array.
+You can also set it at install time — `sudo bash scripts/install.sh --auto-lock --lock-delay 60` — and re-running the installer without flags keeps whatever you had.
+
+When your phone disconnects, the daemon waits the configured delay; if the phone hasn't reconnected by then, the screen locks (same as ⌃⌘Q). Walk back in range and everything resumes. If you have more than one phone paired, the Mac only locks once the last one has gone.
+
+To try it without touching the LaunchAgent: `touchbridged serve --auto-lock --lock-delay 10`.
 
 ---
 

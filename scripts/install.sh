@@ -32,6 +32,33 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; }
 echo "=== TouchBridge Installer ==="
 echo ""
 
+# --- Options ---
+#   --auto-lock          enable proximity auto-lock in the LaunchAgent
+#   --lock-delay <sec>   seconds after phone disconnect before locking (default 30)
+#   --no-auto-lock       disable auto-lock (even if a previous install enabled it)
+# With no options, an existing install's auto-lock settings are preserved.
+# Can be changed later without reinstalling: touchbridge-autolock on|off|status
+AUTO_LOCK=""          # "" = keep existing, 1 = enable, 0 = disable
+LOCK_DELAY=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --auto-lock) AUTO_LOCK=1; shift ;;
+        --no-auto-lock) AUTO_LOCK=0; shift ;;
+        --lock-delay)
+            [ $# -ge 2 ] || { error "--lock-delay requires a value"; exit 1; }
+            LOCK_DELAY="$2"; AUTO_LOCK="${AUTO_LOCK:-1}"; shift 2 ;;
+        --lock-delay=*) LOCK_DELAY="${1#--lock-delay=}"; AUTO_LOCK="${AUTO_LOCK:-1}"; shift ;;
+        -h|--help)
+            sed -n '/^# --- Options ---/,/^AUTO_LOCK=/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
+            exit 0 ;;
+        *) error "unknown option: $1"; exit 1 ;;
+    esac
+done
+if [ -n "$LOCK_DELAY" ] && ! [[ "$LOCK_DELAY" =~ ^[0-9]+$ ]]; then
+    error "--lock-delay must be a whole number of seconds (got '$LOCK_DELAY')"
+    exit 1
+fi
+
 # Check macOS version >= 13.0
 MACOS_VERSION=$(sw_vers -productVersion)
 MAJOR_VERSION=$(echo "$MACOS_VERSION" | cut -d. -f1)
@@ -123,6 +150,12 @@ if [ "$DAEMON_DIR_OWNER" != "0" ] || [ -n "$(find "$DAEMON_DIR" -maxdepth 0 -per
 fi
 info "Installed $DAEMON_BIN"
 
+AUTOLOCK_TOOL="/usr/local/bin/touchbridge-autolock"
+install_fresh "$SCRIPT_DIR/touchbridge-autolock" "$AUTOLOCK_TOOL"
+chown root:wheel "$AUTOLOCK_TOOL"
+chmod 755 "$AUTOLOCK_TOOL"
+info "Installed $AUTOLOCK_TOOL"
+
 info "Installing PAM module..."
 mkdir -p "$(dirname "$PAM_LIB")"
 install_fresh "$PAM_BUILD" "$PAM_LIB"
@@ -152,6 +185,34 @@ tb_enable_gui_admin "prompt"
 
 info "Installing LaunchAgent..."
 
+# Work out auto-lock settings: explicit flags win, otherwise keep whatever the
+# existing plist had so a reinstall/upgrade doesn't silently turn it off.
+EXISTING_ENABLED=0
+EXISTING_DELAY=30
+if [ -f "$LAUNCH_AGENT_PLIST" ]; then
+    i=0
+    while val=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:$i" "$LAUNCH_AGENT_PLIST" 2>/dev/null); do
+        case "$val" in
+            --auto-lock) EXISTING_ENABLED=1 ;;
+            --lock-delay)
+                EXISTING_DELAY=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:$((i + 1))" "$LAUNCH_AGENT_PLIST" 2>/dev/null || echo 30) ;;
+        esac
+        i=$((i + 1))
+    done
+fi
+[ -n "$AUTO_LOCK" ] || AUTO_LOCK="$EXISTING_ENABLED"
+[ -n "$LOCK_DELAY" ] || LOCK_DELAY="$EXISTING_DELAY"
+
+EXTRA_ARGS_XML=""
+if [ "$AUTO_LOCK" = 1 ]; then
+    EXTRA_ARGS_XML="        <string>--auto-lock</string>
+        <string>--lock-delay</string>
+        <string>$LOCK_DELAY</string>"
+    info "Proximity auto-lock: enabled (lock ${LOCK_DELAY}s after phone disconnects)"
+else
+    info "Proximity auto-lock: disabled (enable later with: touchbridge-autolock on)"
+fi
+
 # Unload existing agent if running
 ACTUAL_UID=$(id -u "$ACTUAL_USER")
 launchctl bootout "gui/$ACTUAL_UID/$LAUNCH_AGENT_LABEL" 2>/dev/null || true
@@ -168,6 +229,7 @@ cat > "$LAUNCH_AGENT_PLIST" << PLIST
     <array>
         <string>$DAEMON_BIN</string>
         <string>serve</string>
+$EXTRA_ARGS_XML
     </array>
     <key>RunAtLoad</key>
     <true/>

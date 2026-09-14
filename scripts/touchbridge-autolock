@@ -1,0 +1,133 @@
+#!/bin/bash
+# Configure TouchBridge proximity auto-lock on the installed daemon.
+#
+# Edits the ProgramArguments of the LaunchAgent plist written by install.sh and
+# restarts the daemon so the change takes effect immediately. Run as your normal
+# user (no sudo) — the LaunchAgent lives in your home directory.
+#
+#   touchbridge-autolock on              # enable, keep current/default delay
+#   touchbridge-autolock on --delay 60   # enable, lock 60s after phone disconnects
+#   touchbridge-autolock off             # disable
+#   touchbridge-autolock status          # show current settings
+
+set -euo pipefail
+
+LABEL="dev.touchbridge.daemon"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+PLISTBUDDY="/usr/libexec/PlistBuddy"
+DEFAULT_DELAY=30
+
+usage() {
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+[ $# -ge 1 ] || usage 1
+[ "$(id -u)" -ne 0 ] || die "run this as your normal user, not with sudo"
+[ -f "$PLIST" ] || die "LaunchAgent not found at $PLIST — run 'sudo bash scripts/install.sh' first"
+
+# --- Read current ProgramArguments into an array ---
+read_args() {
+    ARGS=()
+    local i=0 val
+    while val=$("$PLISTBUDDY" -c "Print :ProgramArguments:$i" "$PLIST" 2>/dev/null); do
+        ARGS+=("$val")
+        i=$((i + 1))
+    done
+    [ ${#ARGS[@]} -ge 2 ] || die "unexpected ProgramArguments in $PLIST"
+}
+
+current_enabled() {
+    local a
+    for a in "${ARGS[@]}"; do [ "$a" = "--auto-lock" ] && return 0; done
+    return 1
+}
+
+current_delay() {
+    local i
+    for ((i = 0; i < ${#ARGS[@]}; i++)); do
+        if [ "${ARGS[$i]}" = "--lock-delay" ] && [ $((i + 1)) -lt ${#ARGS[@]} ]; then
+            echo "${ARGS[$((i + 1))]}"
+            return
+        fi
+    done
+    echo "$DEFAULT_DELAY"
+}
+
+# Rewrite ProgramArguments with auto-lock flags stripped, then optionally re-added.
+write_args() {   # write_args <enabled:0|1> <delay>
+    local enabled="$1" delay="$2" new=() i
+    for ((i = 0; i < ${#ARGS[@]}; i++)); do
+        case "${ARGS[$i]}" in
+            --auto-lock) ;;
+            --lock-delay) i=$((i + 1)) ;;   # skip its value too
+            *) new+=("${ARGS[$i]}") ;;
+        esac
+    done
+    if [ "$enabled" = 1 ]; then
+        new+=("--auto-lock" "--lock-delay" "$delay")
+    fi
+
+    "$PLISTBUDDY" -c "Delete :ProgramArguments" "$PLIST" >/dev/null
+    "$PLISTBUDDY" -c "Add :ProgramArguments array" "$PLIST" >/dev/null
+    for ((i = 0; i < ${#new[@]}; i++)); do
+        "$PLISTBUDDY" -c "Add :ProgramArguments:$i string ${new[$i]}" "$PLIST" >/dev/null
+    done
+    plutil -lint "$PLIST" >/dev/null || die "plist failed validation after edit"
+}
+
+restart_daemon() {
+    # launchd caches the plist at bootstrap time; a plain kickstart would
+    # relaunch with the OLD arguments, so bootout + bootstrap first.
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+    launchctl kickstart -k "$DOMAIN/$LABEL"
+}
+
+print_status() {
+    if current_enabled; then
+        echo "Auto-lock: ENABLED — Mac locks $(current_delay)s after your phone disconnects"
+    else
+        echo "Auto-lock: disabled"
+    fi
+}
+
+read_args
+cmd="$1"; shift
+
+case "$cmd" in
+    on|enable)
+        delay="$(current_delay)"
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --delay|-d)
+                    [ $# -ge 2 ] || die "--delay requires a value"
+                    delay="$2"; shift 2 ;;
+                --delay=*) delay="${1#--delay=}"; shift ;;
+                *) die "unknown option: $1" ;;
+            esac
+        done
+        [[ "$delay" =~ ^[0-9]+$ ]] || die "delay must be a whole number of seconds (got '$delay')"
+        write_args 1 "$delay"
+        restart_daemon
+        read_args; print_status
+        ;;
+    off|disable)
+        [ $# -eq 0 ] || die "'off' takes no options"
+        write_args 0 "$DEFAULT_DELAY"
+        restart_daemon
+        read_args; print_status
+        ;;
+    status)
+        print_status
+        ;;
+    -h|--help|help)
+        usage 0
+        ;;
+    *)
+        die "unknown command: $cmd (expected on, off, or status)"
+        ;;
+esac

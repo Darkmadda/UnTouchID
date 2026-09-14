@@ -382,6 +382,34 @@ enum TestSetupError: Error { case ecdhFailed }
     #expect(coordinator.readyCentrals.count == 2)
 }
 
+@Test func connectionStateCallbackDrivesProximityLock() async throws {
+    // Regression: --auto-lock never fired because ProximityMonitor was never
+    // told about BLE disconnects. The coordinator must report connect/disconnect,
+    // and only report "disconnected" once the LAST companion is gone.
+    let (coordinator, bleServer, _, _) = makeTestCoordinator()
+    var states: [Bool] = []
+    var lockCalled = false
+    let monitor = ProximityMonitor(rssiThreshold: -80, disconnectDelay: 0.05) {
+        lockCalled = true
+    }
+    monitor.enable()
+    coordinator.onConnectionStateChanged = { connected in
+        states.append(connected)
+        monitor.connectionStateChanged(connected: connected)
+    }
+
+    let c1 = UUID(), c2 = UUID()
+    bleServer.simulateConnect(c1)
+    bleServer.simulateConnect(c2)
+    bleServer.simulateDisconnect(c1)
+    #expect(states == [true, true, true])   // one phone still present
+
+    bleServer.simulateDisconnect(c2)
+    #expect(states.last == false)
+    try? await Task.sleep(nanoseconds: 150_000_000)
+    #expect(lockCalled)
+}
+
 // MARK: - Identify Tests
 
 @Test func identifyKnownDeviceSetsDeviceID() async throws {

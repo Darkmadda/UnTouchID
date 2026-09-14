@@ -35,6 +35,15 @@ struct Serve: ParsableCommand {
     @Flag(name: .long, help: "Enable proximity auto-lock — lock Mac when companion disconnects.")
     var autoLock: Bool = false
 
+    @Option(name: .long, help: "Seconds to wait after the companion disconnects before locking (default: 30). Only used with --auto-lock.")
+    var lockDelay: Int = 30
+
+    func validate() throws {
+        guard lockDelay >= 0 else {
+            throw ValidationError("--lock-delay must be 0 or greater.")
+        }
+    }
+
     func run() throws {
         if simulator || interactive {
             try runSimulatorMode()
@@ -139,20 +148,25 @@ struct Serve: ParsableCommand {
         // Proximity auto-lock
         var proximityMonitor: ProximityMonitor?
         if autoLock {
-            let monitor = ProximityMonitor(rssiThreshold: rssiThreshold - 5)
-            monitor.enable()
-            monitor.onShouldLock = {
-                print("Proximity auto-lock: locking screen")
+            let monitor = ProximityMonitor(
+                rssiThreshold: rssiThreshold - 5,
+                disconnectDelay: TimeInterval(lockDelay)
+            )
+            monitor.onStatus = { message in
+                print("Proximity auto-lock: \(message)")
             }
+            monitor.enable()
             proximityMonitor = monitor
 
-            coordinator.onChallengeResult = { challengeID, result, deviceID in
-                print("Challenge \(challengeID): \(result) (device: \(deviceID ?? "unknown"))")
+            // Feed BLE connect/disconnect events into the monitor. Without this
+            // the monitor never learns the phone left and never locks.
+            coordinator.onConnectionStateChanged = { anyConnected in
+                monitor.connectionStateChanged(connected: anyConnected)
             }
-        } else {
-            coordinator.onChallengeResult = { challengeID, result, deviceID in
-                print("Challenge \(challengeID): \(result) (device: \(deviceID ?? "unknown"))")
-            }
+        }
+
+        coordinator.onChallengeResult = { challengeID, result, deviceID in
+            print("Challenge \(challengeID): \(result) (device: \(deviceID ?? "unknown"))")
         }
 
         coordinator.onPairingComplete = { device in
@@ -177,7 +191,7 @@ struct Serve: ParsableCommand {
             print("Advertising TouchBridge service over BLE...")
             print("Waiting for companion device connections.")
             if self.autoLock {
-                print("Proximity auto-lock: ENABLED")
+                print("Proximity auto-lock: ENABLED (lock \(self.lockDelay)s after disconnect)")
             }
         }
 

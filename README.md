@@ -259,9 +259,11 @@ They're complementary — you'd use both. Passkeys for the web. TouchBridge for 
 | **Web** | `touchbridged serve --web` | Any phone via browser |
 | **Simulator** | `touchbridged serve --simulator` | Testing, CI, demos |
 | **Interactive** | `touchbridged serve --interactive` | Terminal approve/deny |
-| **Auto-lock** | `touchbridged serve --auto-lock` | Lock when phone leaves |
+| **Auto-lock** | `touchbridged serve --auto-lock [--lock-delay 30]` | Lock when phone leaves |
 
 Flags can be combined: `touchbridged serve --web --auto-lock`
+
+For the installed daemon, toggle auto-lock without reinstalling: `touchbridge-autolock on --delay 60`, `touchbridge-autolock off`, `touchbridge-autolock status`. Or pass `--auto-lock [--lock-delay N]` to `install.sh`.
 
 Every response the daemon sends to the PAM module is tagged with its mode.
 `pam_touchbridge` only accepts **Production** answers unless the PAM line

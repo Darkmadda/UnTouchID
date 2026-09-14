@@ -20,7 +20,22 @@
 - `install.sh` now sets root ownership on the daemon binary explicitly, ad-hoc
   signs it if unsigned, and warns when its directory is not root-owned.
 
+### Fixed
+- **`--auto-lock` never locked.** The proximity monitor was created but never
+  received BLE connect/disconnect events, so the disconnect countdown never
+  started. The coordinator now reports connection state
+  (`onConnectionStateChanged`) and the daemon feeds it to the monitor. The lock
+  action also now actually locks the screen (`SACLockScreenImmediate`, same as
+  ⌃⌘Q) instead of only sleeping the display, which left the Mac unlocked unless
+  "require password immediately after sleep" was set.
+
 ### Added
+- `touchbridged serve --lock-delay <seconds>` — how long after the phone
+  disconnects before auto-lock fires (default 30).
+- `touchbridge-autolock on [--delay N] | off | status` — configure auto-lock on
+  the installed daemon without reinstalling. Installed to `/usr/local/bin`.
+- `install.sh --auto-lock [--lock-delay N]` / `--no-auto-lock`; a reinstall
+  without flags preserves the existing auto-lock settings.
 - **GUI admin prompts** (System Settings, installers, any app using
   Authorization Services) can be approved on the phone. The PAM service file is
   `screensaver_new` on macOS 26 and `authorization` on older releases;

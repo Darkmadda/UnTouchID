@@ -42,6 +42,11 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
     /// Callback invoked when pairing completes.
     public var onPairingComplete: ((PairedDevice) -> Void)?
 
+    /// Callback invoked whenever a companion connects or disconnects.
+    /// The Bool is `true` while at least one companion is connected, `false`
+    /// once the last one has gone. Used to drive proximity auto-lock.
+    public var onConnectionStateChanged: ((Bool) -> Void)?
+
     private struct SessionState {
         var ephemeralPrivateKey: P256.KeyAgreement.PrivateKey?
         var sessionCrypto: SessionCrypto?
@@ -290,12 +295,20 @@ extension DaemonCoordinator: BLEServerDelegate {
 
     public func bleServer(_ server: any BLEServerInterface, centralDidConnect centralID: UUID) {
         logger.info("Central connected: \(centralID)")
-        stateLock.withLock { sessions[centralID] = SessionState() }
+        let anyConnected = stateLock.withLock {
+            sessions[centralID] = SessionState()
+            return !sessions.isEmpty
+        }
+        onConnectionStateChanged?(anyConnected)
     }
 
     public func bleServer(_ server: any BLEServerInterface, centralDidDisconnect centralID: UUID) {
         logger.info("Central disconnected: \(centralID)")
-        stateLock.withLock { _ = sessions.removeValue(forKey: centralID) }
+        let anyConnected = stateLock.withLock {
+            _ = sessions.removeValue(forKey: centralID)
+            return !sessions.isEmpty
+        }
+        onConnectionStateChanged?(anyConnected)
     }
 
     public func bleServer(_ server: any BLEServerInterface, didReceiveSessionKey data: Data, from centralID: UUID) -> Data? {

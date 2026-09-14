@@ -22,6 +22,11 @@ public final class ProximityMonitor: @unchecked Sendable {
     /// Callback when the Mac should be locked.
     public var onShouldLock: (() -> Void)?
 
+    /// Human-readable status updates (countdown started, cancelled, locked).
+    /// The daemon CLI prints these so the user can see what auto-lock is doing
+    /// without digging through the unified log.
+    public var onStatus: ((String) -> Void)?
+
     /// Initialize with configurable RSSI threshold and delay.
     ///
     /// - Parameters:
@@ -31,7 +36,7 @@ public final class ProximityMonitor: @unchecked Sendable {
         self.init(
             rssiThreshold: rssiThreshold,
             disconnectDelay: disconnectDelay,
-            lockAction: ProximityMonitor.systemDisplaySleep
+            lockAction: ProximityMonitor.systemLockScreen
         )
     }
 
@@ -63,12 +68,17 @@ public final class ProximityMonitor: @unchecked Sendable {
             // Cancel any pending lock
             disconnectTimer?.cancel()
             disconnectTimer = nil
+            let hadPendingLock = !lastConnectedState
             lastConnectedState = true
-            logger.info("Companion reconnected — auto-lock cancelled")
+            if hadPendingLock {
+                logger.info("Companion reconnected — auto-lock cancelled")
+                onStatus?("Companion reconnected — auto-lock cancelled")
+            }
         } else if lastConnectedState {
             // Device disconnected — start countdown
             lastConnectedState = false
             logger.info("Companion disconnected — will lock in \(self.disconnectDelay)s if not reconnected")
+            onStatus?("Companion disconnected — locking in \(Int(disconnectDelay))s unless it reconnects")
 
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self, self.isEnabled, !self.lastConnectedState else { return }
@@ -89,15 +99,43 @@ public final class ProximityMonitor: @unchecked Sendable {
         }
     }
 
-    /// Lock the Mac screen using the CGSession command.
+    /// Lock the Mac screen.
     private func lockScreen() {
         onShouldLock?()
+        onStatus?("Locking screen")
 
         lockAction()
         logger.info("Screen lock action completed")
     }
 
-    private static func systemDisplaySleep() {
+    /// Lock the screen the same way the Apple menu's "Lock Screen" (⌃⌘Q) does.
+    ///
+    /// Uses `SACLockScreenImmediate` from the private login.framework — the only
+    /// reliable way to lock (rather than merely sleep the display) without
+    /// requiring Accessibility permission for synthesized keystrokes. Falls back
+    /// to `pmset displaysleepnow`, which only locks if the user has "Require
+    /// password immediately after sleep" enabled.
+    private static func systemLockScreen() {
+        let logger = Logger(subsystem: "dev.touchbridge", category: "ProximityMonitor")
+
+        if let handle = dlopen("/System/Library/PrivateFrameworks/login.framework/login", RTLD_NOW) {
+            defer { dlclose(handle) }
+            if let sym = dlsym(handle, "SACLockScreenImmediate") {
+                typealias LockFn = @convention(c) () -> Int32
+                let lock = unsafeBitCast(sym, to: LockFn.self)
+                let rc = lock()
+                if rc == 0 {
+                    logger.info("Locked screen via SACLockScreenImmediate")
+                    return
+                }
+                logger.warning("SACLockScreenImmediate returned \(rc); falling back to display sleep")
+            } else {
+                logger.warning("SACLockScreenImmediate not found; falling back to display sleep")
+            }
+        } else {
+            logger.warning("Could not load login.framework; falling back to display sleep")
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
         process.arguments = ["displaysleepnow"]
@@ -106,8 +144,7 @@ public final class ProximityMonitor: @unchecked Sendable {
             try process.run()
             process.waitUntilExit()
         } catch {
-            Logger(subsystem: "dev.touchbridge", category: "ProximityMonitor")
-                .error("Failed to lock screen: \(error.localizedDescription)")
+            logger.error("Failed to lock screen: \(error.localizedDescription)")
         }
     }
 

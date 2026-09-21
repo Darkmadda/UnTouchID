@@ -3,6 +3,8 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var appState: AppState
     @State private var showUnpairConfirm = false
+    @State private var keychainUnlockOn = false
+    @State private var keychainUnlockError: String?
 
     var body: some View {
         List {
@@ -49,6 +51,31 @@ struct SettingsView: View {
                 LabeledContent("BLE", value: appState.coordinator.isConnected ? "Active" : "Idle")
             }
 
+            Section {
+                Toggle("Unlock Mac Keychain", isOn: $keychainUnlockOn)
+                    .onChange(of: keychainUnlockOn) { newValue in
+                        if newValue {
+                            do {
+                                try appState.coordinator.enableKeychainUnlock()
+                                keychainUnlockError = nil
+                            } catch {
+                                keychainUnlockOn = false
+                                keychainUnlockError = "Couldn't enable: \(error.localizedDescription)"
+                            }
+                        } else {
+                            appState.coordinator.disableKeychainUnlock()
+                            keychainUnlockError = nil
+                        }
+                    }
+                if let keychainUnlockError {
+                    Text(keychainUnlockError).font(.caption).foregroundStyle(.red)
+                }
+            } header: {
+                Text("Mac Keychain")
+            } footer: {
+                Text("Approve unlocking your Mac's login keychain from this phone (Face ID / Touch ID), so it unlocks together with the screen. After turning this on, run `touchbridge-test keychain setup` on your Mac to finish. Your private key never leaves this device's Secure Enclave.")
+            }
+
             Section("About") {
                 LabeledContent("Version", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0")
                 LabeledContent("Build", value: Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1")
@@ -70,6 +97,9 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .onAppear {
+            keychainUnlockOn = appState.coordinator.isKeychainUnlockEnabled
+        }
         .confirmationDialog(
             "Unpair from Mac?",
             isPresented: $showUnpairConfirm,

@@ -5,6 +5,9 @@
 ### Keychain items with `kSecAccessControlBiometryCurrentSet`
 macOS Keychain items sealed with biometric ACLs require the local Secure Enclave to unwrap them. This is a hardware-level restriction — no software can bypass it. TouchBridge cannot unlock these items.
 
+### Login keychain unlock on screen unlock (default)
+By default, unlocking the screen via TouchBridge does **not** unlock the login keychain — only Apple's own password/Touch ID paths are wired into `securityd`, so a third-party PAM unlock leaves the keychain locked. An **opt-in** feature closes this gap by re-keying the keychain to a decoupled random password and having your phone unwrap it; it changes the security model and is off by default. See [keychain-unlock.md](keychain-unlock.md).
+
 ### Sandboxed App Store apps calling LAContext
 Third-party apps distributed via the App Store that call `LAContext.evaluatePolicy` internally are sandboxed. TouchBridge cannot intercept these calls due to SIP and sandbox restrictions.
 

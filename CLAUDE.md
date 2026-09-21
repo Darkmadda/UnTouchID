@@ -25,6 +25,10 @@ cd daemon && swift test --filter PairedDeviceStore
 cd daemon && swift test --filter SocketServer
 cd daemon && swift test --filter PolicyEngine
 cd daemon && swift test --filter PAMIntegration
+
+# Keychain-unlock feature (opt-in)
+cd protocol && swift test --filter KeychainSecretCrypto   # wrap/unwrap crypto
+cd daemon && swift test --filter keychain                 # enroll + unlock flow
 ```
 
 ## Install / Uninstall

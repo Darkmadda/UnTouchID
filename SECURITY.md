@@ -27,6 +27,18 @@ If you discover a security vulnerability in TouchBridge, please report it respon
 - **Compromised macOS kernel**: If the kernel is compromised, no user-space security holds
 - **A same-user attacker who can pair their own phone**: pairing is a user-level operation (`touchbridge-test pair`), so code running as you, with a phone in Bluetooth range, could pair it and approve its own requests. This requires physical presence, unlike the socket attack below.
 
+### Opt-in keychain unlock changes this model
+
+The default build never stores your password and can only ever leak a *session*
+unlock. The optional [keychain unlock](docs/keychain-unlock.md) feature
+deliberately relaxes this: it stores a **decoupled random** login-keychain
+password at rest, encrypted so only a paired phone's Secure Enclave can unwrap
+it. The stored secret is a random, keychain-scoped string — never your account
+password — so a phone-key compromise or a compelled Face ID yields only that one
+keychain, not reusable credentials. It is off by default; enabling it is an
+informed trade of blast radius for convenience. See the doc for the full analysis
+(including the confused-deputy caveat) and the four recovery paths.
+
 ### Daemon identity verification (socket spoofing)
 
 The PAM module talks to the daemon over a Unix socket in the user's home

@@ -96,6 +96,9 @@ final class CompanionSimulator: @unchecked Sendable {
     private(set) var sessionCrypto: SessionCrypto?
     private var ecdhPrivateKey: P256.KeyAgreement.PrivateKey?
 
+    // Keychain-unlock key-agreement key (simulates the phone's second SE key).
+    private var keychainUnlockPrivateKey: P256.KeyAgreement.PrivateKey?
+
     init(
         centralID: UUID = UUID(),
         deviceID: String = UUID().uuidString,
@@ -224,6 +227,46 @@ final class CompanionSimulator: @unchecked Sendable {
         var wire = Data([1, 5]) // version=1, type=error(5)
         wire.append(encrypted)
         return wire
+    }
+
+    // MARK: - Keychain Unlock
+
+    /// The phone's keychain-unlock public key (x963), created on first use.
+    func keychainUnlockPublicKeyData() -> Data {
+        let key = keychainUnlockPrivateKey ?? P256.KeyAgreement.PrivateKey()
+        keychainUnlockPrivateKey = key
+        return key.publicKey.x963Representation
+    }
+
+    /// Create an encrypted enroll message: [1, 7] + AES-GCM(JSON KeychainEnrollMessage).
+    func makeKeychainEnrollData() throws -> Data {
+        guard let crypto = sessionCrypto else { throw CompanionError.noSession }
+        let msg = KeychainEnrollMessage(deviceID: deviceID, unlockPublicKey: keychainUnlockPublicKeyData())
+        let json = try JSONEncoder().encode(msg)
+        let encrypted = try crypto.encrypt(plaintext: json)
+        var wire = Data([1, MessageType.keychainEnroll.rawValue])
+        wire.append(encrypted)
+        return wire
+    }
+
+    /// Given a keychainUnlockRequest wire frame, return the response wire frame
+    /// carrying the ECDH shared secret (the blind unwrap the phone performs).
+    func respondToKeychainUnlockRequest(_ wire: Data) throws -> Data {
+        guard let crypto = sessionCrypto else { throw CompanionError.noSession }
+        guard wire.count > 2 else { throw CompanionError.invalidData }
+        let plaintext = try crypto.decrypt(ciphertext: Data(wire.dropFirst(2)))
+        let req = try WireFormat.decodePayload(KeychainUnlockRequestMessage.self, from: plaintext)
+        guard let key = keychainUnlockPrivateKey else { throw CompanionError.noSession }
+        let shared = try KeychainSecretCrypto.rawSharedSecret(
+            recipientPrivateKey: key,
+            ephemeralPublicKey: req.ephemeralPublicKey
+        )
+        let resp = KeychainUnlockResponseMessage(requestID: req.requestID, sharedSecret: shared)
+        let json = try JSONEncoder().encode(resp)
+        let encrypted = try crypto.encrypt(plaintext: json)
+        var out = Data([1, MessageType.keychainUnlockResponse.rawValue])
+        out.append(encrypted)
+        return out
     }
 
     enum CompanionError: Error {
@@ -1045,4 +1088,206 @@ private func lastPairResponse(_ bleServer: MockBLEServer) throws -> PairResponse
     bleServer.simulateResponse(try companion.respondToChallenge(challenge2.data), from: companion.centralID)
     let second = await secondAuth
     #expect(second.success == true)
+}
+
+// MARK: - Keychain Unlock Tests
+
+/// Coordinator wired with a temp keychain store and an in-memory unlocker.
+private func makeKeychainCoordinator() -> (
+    coordinator: DaemonCoordinator,
+    bleServer: MockBLEServer,
+    deviceStore: PairedDeviceStore,
+    keychainStore: KeychainSecretStore,
+    unlocker: MockKeychainUnlocker
+) {
+    let bleServer = MockBLEServer()
+    let deviceStore = makeTempDeviceStore()
+    let keychainStore = makeTempKeychainStore()
+    let unlocker = MockKeychainUnlocker(locked: true)
+    let logDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("tb-test-\(UUID().uuidString)")
+    let coordinator = DaemonCoordinator(
+        deviceStore: deviceStore,
+        auditLog: AuditLog(logDirectory: logDir),
+        bleServer: bleServer,
+        keychainStore: keychainStore,
+        keychainUnlocker: unlocker
+    )
+    return (coordinator, bleServer, deviceStore, keychainStore, unlocker)
+}
+
+/// Send a keychain-enroll message and let the async handler settle.
+private func enroll(
+    _ companion: CompanionSimulator,
+    to coordinator: DaemonCoordinator,
+    via bleServer: MockBLEServer
+) async throws {
+    bleServer.simulatePairingData(try companion.makeKeychainEnrollData(), from: companion.centralID)
+    try await Task.sleep(nanoseconds: 200_000_000)
+}
+
+/// Locate the last keychainUnlockRequest among sent notifications.
+private func lastUnlockRequest(_ bleServer: MockBLEServer) -> (data: Data, centralID: UUID)? {
+    bleServer.sentChallenges.last {
+        $0.data.count > 1 && $0.data[$0.data.startIndex + 1] == MessageType.keychainUnlockRequest.rawValue
+    }
+}
+
+@Test func keychainEnrollStoresUnlockKey() async throws {
+    let (coordinator, bleServer, deviceStore, keychainStore, _) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    let enrollments = try keychainStore.enrollments()
+    #expect(enrollments.count == 1)
+    #expect(enrollments.first?.deviceID == companion.deviceID)
+    #expect(enrollments.first?.unlockPublicKey == companion.keychainUnlockPublicKeyData())
+    #expect(enrollments.first?.wrapped == nil)      // setup hasn't run
+    #expect(keychainStore.isActive() == false)      // inert until wrapped
+}
+
+@Test func keychainEnrollRejectedWhenNotIdentified() async throws {
+    let (coordinator, bleServer, _, keychainStore, _) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+
+    // ECDH only — never registered/identified.
+    bleServer.simulateConnect(companion.centralID)
+    let serverPub = bleServer.simulateSessionKey(companion.ecdhPublicKeyData(), from: companion.centralID)!
+    try companion.completeECDH(daemonPublicKeyData: serverPub)
+
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    #expect(try keychainStore.enrollments().isEmpty)
+}
+
+@Test func keychainUnlockHappyPath() async throws {
+    let (coordinator, bleServer, deviceStore, keychainStore, unlocker) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    // Simulate `keychain-setup`: wrap a random password to the phone's key.
+    let randomPW = "R4nd0m-Keychain-Pass"
+    let wrapped = try KeychainSecretCrypto.wrap(
+        secret: Data(randomPW.utf8),
+        recipientPublicKey: companion.keychainUnlockPublicKeyData()
+    )
+    try keychainStore.setWrappedSecret(
+        forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
+    #expect(keychainStore.isActive())
+
+    async let done: Void = coordinator.performKeychainUnlock(
+        centralID: companion.centralID, deviceID: companion.deviceID, reason: "test")
+
+    try await Task.sleep(nanoseconds: 150_000_000)
+    guard let req = lastUnlockRequest(bleServer) else {
+        Issue.record("No keychain unlock request sent"); return
+    }
+    bleServer.simulateResponse(try companion.respondToKeychainUnlockRequest(req.data), from: companion.centralID)
+    await done
+
+    #expect(unlocker.unlockedWith == [randomPW])
+    #expect(unlocker.isLockedNow == false)
+}
+
+@Test func keychainUnlockSkipsWhenAlreadyUnlocked() async throws {
+    let (coordinator, bleServer, deviceStore, keychainStore, unlocker) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    let wrapped = try KeychainSecretCrypto.wrap(
+        secret: Data("pw".utf8), recipientPublicKey: companion.keychainUnlockPublicKeyData())
+    try keychainStore.setWrappedSecret(
+        forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
+
+    unlocker.setLocked(false) // already unlocked — no Face ID should be requested
+
+    await coordinator.performKeychainUnlock(
+        centralID: companion.centralID, deviceID: companion.deviceID, reason: "test")
+
+    #expect(lastUnlockRequest(bleServer) == nil)
+    #expect(unlocker.unlockedWith.isEmpty)
+}
+
+@Test func keychainUnlockNoOpWithoutSetup() async throws {
+    let (coordinator, bleServer, deviceStore, _, unlocker) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+    try await enroll(companion, to: coordinator, via: bleServer)
+    // No setWrappedSecret → not set up.
+
+    await coordinator.performKeychainUnlock(
+        centralID: companion.centralID, deviceID: companion.deviceID, reason: "test")
+
+    #expect(lastUnlockRequest(bleServer) == nil)
+    #expect(unlocker.unlockedWith.isEmpty)
+}
+
+@Test func screensaverAuthTriggersKeychainUnlock() async throws {
+    let (coordinator, bleServer, deviceStore, keychainStore, unlocker) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    let randomPW = "unlock-me-42"
+    let wrapped = try KeychainSecretCrypto.wrap(
+        secret: Data(randomPW.utf8), recipientPublicKey: companion.keychainUnlockPublicKeyData())
+    try keychainStore.setWrappedSecret(
+        forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
+
+    // Screen-unlock auth.
+    async let auth = coordinator.authenticateFromPAM(
+        user: "u", service: "screensaver", pid: 1, timeout: 5.0)
+    try await Task.sleep(nanoseconds: 150_000_000)
+    guard let challenge = bleServer.sentChallenges.first(where: {
+        $0.data.count > 1 && $0.data[$0.data.startIndex + 1] == MessageType.challengeIssued.rawValue
+    }) else { Issue.record("No challenge sent"); return }
+    bleServer.simulateResponse(try companion.respondToChallenge(challenge.data), from: companion.centralID)
+    let result = await auth
+    #expect(result.success == true)
+
+    // The fire-and-forget unlock now runs; respond to its request.
+    try await Task.sleep(nanoseconds: 200_000_000)
+    guard let req = lastUnlockRequest(bleServer) else {
+        Issue.record("Auth success did not trigger a keychain unlock request"); return
+    }
+    bleServer.simulateResponse(try companion.respondToKeychainUnlockRequest(req.data), from: companion.centralID)
+    try await Task.sleep(nanoseconds: 200_000_000)
+
+    #expect(unlocker.unlockedWith == [randomPW])
+    #expect(unlocker.isLockedNow == false)
+}
+
+@Test func sudoAuthDoesNotTriggerKeychainUnlock() async throws {
+    let (coordinator, bleServer, deviceStore, keychainStore, unlocker) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    let wrapped = try KeychainSecretCrypto.wrap(
+        secret: Data("pw".utf8), recipientPublicKey: companion.keychainUnlockPublicKeyData())
+    try keychainStore.setWrappedSecret(
+        forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
+
+    async let auth = coordinator.authenticateFromPAM(
+        user: "u", service: "sudo", pid: 1, timeout: 5.0)
+    try await Task.sleep(nanoseconds: 150_000_000)
+    let challenge = bleServer.sentChallenges.first {
+        $0.data.count > 1 && $0.data[$0.data.startIndex + 1] == MessageType.challengeIssued.rawValue
+    }!
+    bleServer.simulateResponse(try companion.respondToChallenge(challenge.data), from: companion.centralID)
+    #expect(await auth.success == true)
+
+    try await Task.sleep(nanoseconds: 200_000_000)
+    #expect(lastUnlockRequest(bleServer) == nil)   // sudo must not unlock the keychain
+    #expect(unlocker.unlockedWith.isEmpty)
 }

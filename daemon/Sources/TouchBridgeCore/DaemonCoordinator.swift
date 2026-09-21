@@ -10,7 +10,7 @@ import TouchBridgeProtocol
 /// This is the central integration point that wires events from the BLE layer
 /// to the crypto and storage layers.
 public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Sendable {
-    private let logger = Logger(subsystem: "dev.touchbridge", category: "Coordinator")
+    let logger = Logger(subsystem: "dev.touchbridge", category: "Coordinator")
 
     // Components
     public let bleServer: any BLEServerInterface
@@ -19,19 +19,29 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
     public let deviceStore: PairedDeviceStore
     public let auditLog: AuditLog
 
+    /// Opt-in keychain-unlock state (enrollments + wrapped secrets). Inert until
+    /// the user has run `keychain-setup`, at which point `isActive()` is true.
+    public let keychainStore: KeychainSecretStore
+    /// Performs the actual login-keychain unlock (injectable for tests).
+    let keychainUnlocker: KeychainUnlocking
+
     /// Guards `sessions` and `pendingAuthentications` — both are mutated from
     /// CoreBluetooth delegate callbacks, detached Tasks, and PAM auth calls,
     /// which run on different threads.
-    private let stateLock = NSLock()
+    let stateLock = NSLock()
 
     // Per-central session state (access only while holding stateLock)
-    private var sessions: [UUID: SessionState] = [:]
+    var sessions: [UUID: SessionState] = [:]
 
     /// Pending PAM authentications awaiting challenge results.
-    /// Each auth broadcast stores the same OnceContinuation under multiple challenge IDs
+    /// Each auth broadcast stores the same PendingAuth under multiple challenge IDs
     /// (one per device), so the first valid response wins and subsequent responses are no-ops.
     /// (access only while holding stateLock)
-    private var pendingAuthentications: [UUID: OnceContinuation] = [:]
+    private var pendingAuthentications: [UUID: PendingAuth] = [:]
+
+    /// Pending keychain-unlock handshakes awaiting the phone's ECDH shared secret,
+    /// keyed by requestID. (access only while holding stateLock)
+    var pendingUnlocks: [UUID: UnlockContinuation] = [:]
 
     /// Periodic maintenance task pruning expired challenges and replay nonces.
     private var pruneTask: Task<Void, Never>?
@@ -47,7 +57,7 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
     /// once the last one has gone. Used to drive proximity auto-lock.
     public var onConnectionStateChanged: ((Bool) -> Void)?
 
-    private struct SessionState {
+    struct SessionState {
         var ephemeralPrivateKey: P256.KeyAgreement.PrivateKey?
         var sessionCrypto: SessionCrypto?
         var deviceID: String?
@@ -60,11 +70,15 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
         pairingManager: PairingManager? = nil,
         rssiThreshold: Int = TouchBridgeConstants.defaultRSSIThreshold,
         serviceUUID: String = TouchBridgeConstants.serviceUUID,
-        bleServer: (any BLEServerInterface)? = nil
+        bleServer: (any BLEServerInterface)? = nil,
+        keychainStore: KeychainSecretStore = KeychainSecretStore.standard(),
+        keychainUnlocker: KeychainUnlocking = SystemKeychainUnlocker()
     ) {
         self.deviceStore = deviceStore
         self.auditLog = auditLog
         self.challengeManager = challengeManager
+        self.keychainStore = keychainStore
+        self.keychainUnlocker = keychainUnlocker
         self.bleServer = bleServer ?? BLEServer(rssiThreshold: rssiThreshold, serviceUUID: serviceUUID)
 
         let pm = pairingManager ?? PairingManager(deviceStore: deviceStore, serviceUUID: serviceUUID)
@@ -226,9 +240,12 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
         // Challenge IDs issued for THIS auth — cleaned up once the auth resolves,
         // so losing/timed-out entries don't leak in pendingAuthentications.
         let issuedIDs = LockedBox<[UUID]>([])
+        // Records which device's response verified, so a post-auth keychain
+        // unlock (if enabled) targets exactly the phone that just approved.
+        let winnerBox = LockedBox<AuthWinner?>(nil)
 
         let result: ChallengeResult? = await withCheckedContinuation { outer in
-            let wrapped = OnceContinuation(outer)
+            let pending = PendingAuth(cont: OnceContinuation(outer), winner: winnerBox)
 
             // Challenge-dispatch task: issue to all identified devices, then just wait.
             Task {
@@ -236,14 +253,14 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
                 for centralID in targets {
                     if let challengeID = await self.issueChallenge(to: centralID, reason: challengeReason) {
                         self.stateLock.withLock {
-                            self.pendingAuthentications[challengeID] = wrapped
+                            self.pendingAuthentications[challengeID] = pending
                         }
                         issuedIDs.mutate { $0.append(challengeID) }
                         issued += 1
                     }
                 }
                 if issued == 0 {
-                    wrapped.resume(returning: .unknownChallenge)
+                    pending.cont.resume(returning: .unknownChallenge)
                 }
                 // Otherwise: wait — the first device response (or timeout below) resumes outer.
             }
@@ -251,7 +268,7 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
             // Timeout task: resumes with nil after the deadline.
             Task {
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                wrapped.resume(returning: nil)
+                pending.cont.resume(returning: nil)
             }
         }
 
@@ -264,6 +281,12 @@ public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Senda
         }
 
         if let result, result == .verified {
+            // Fire-and-forget: the screen/login unlock must not wait on the
+            // keychain handshake. No-op unless keychain unlock is set up, the
+            // service is a session-unlock surface, and the keychain is locked.
+            if let winner = winnerBox.value {
+                Task { await self.unlockKeychainAfterAuth(service: service, winner: winner) }
+            }
             return (true, nil)
         }
 
@@ -356,6 +379,15 @@ extension DaemonCoordinator: BLEServerDelegate {
                     return
                 }
 
+                // Keychain-unlock enrollment: the phone is registering its
+                // biometric-gated key-agreement public key. Session-encrypted.
+                if data.count >= 2, data[data.startIndex] == 1,
+                   let msgType = MessageType(rawValue: data[data.startIndex + 1]),
+                   msgType == .keychainEnroll {
+                    await handleKeychainEnroll(data: data, from: centralID)
+                    return
+                }
+
                 let (_, payload) = try WireFormat.decode(data: data)
                 let request = try WireFormat.decodePayload(PairRequestMessage.self, from: payload)
 
@@ -432,11 +464,17 @@ extension DaemonCoordinator: BLEServerDelegate {
                             deviceID: errMsg.description,
                             result: "FAILED_KEY_INVALIDATED"
                         ))
-                        let continuation = stateLock.withLock {
+                        let pending = stateLock.withLock {
                             pendingAuthentications.removeValue(forKey: challengeID)
                         }
-                        continuation?.resume(returning: .keyInvalidated)
+                        pending?.cont.resume(returning: .keyInvalidated)
                     }
+                    return
+                }
+
+                // Keychain-unlock reply: the phone returned the ECDH shared secret.
+                if msgType == .keychainUnlockResponse {
+                    try handleKeychainUnlockResponse(payload: payload, from: centralID)
                     return
                 }
 
@@ -478,11 +516,15 @@ extension DaemonCoordinator: BLEServerDelegate {
                     latencyMs: latencyMs
                 ))
 
-                // Resume any pending PAM authentication continuation
-                let continuation = stateLock.withLock {
+                // Resume any pending PAM authentication continuation, recording
+                // the winning device so a post-auth keychain unlock targets it.
+                let pending = stateLock.withLock {
                     pendingAuthentications.removeValue(forKey: challengeID)
                 }
-                continuation?.resume(returning: result)
+                if result == .verified {
+                    pending?.winner.mutate { $0 = (centralID: centralID, deviceID: response.deviceID) }
+                }
+                pending?.cont.resume(returning: result)
 
                 onChallengeResult?(challengeID, result, response.deviceID)
 
@@ -578,6 +620,46 @@ final class OnceContinuation: @unchecked Sendable {
     }
 
     func resume(returning value: ChallengeResult?) {
+        lock.withLock {
+            guard let c = inner else { return }
+            inner = nil
+            c.resume(returning: value)
+        }
+    }
+}
+
+// MARK: - PendingAuth
+
+/// The device (central + deviceID) whose response verified a PAM auth.
+typealias AuthWinner = (centralID: UUID, deviceID: String)
+
+/// A pending PAM authentication: the once-only continuation plus a shared box
+/// recording which device won, so the post-auth keychain unlock can target it.
+/// One instance is stored under every challenge ID an auth broadcasts.
+final class PendingAuth: @unchecked Sendable {
+    let cont: OnceContinuation
+    let winner: LockedBox<AuthWinner?>
+
+    init(cont: OnceContinuation, winner: LockedBox<AuthWinner?>) {
+        self.cont = cont
+        self.winner = winner
+    }
+}
+
+// MARK: - UnlockContinuation
+
+/// Wraps a `CheckedContinuation` for one keychain-unlock handshake so it can be
+/// resumed at most once — by the phone's response or by the timeout, whichever
+/// fires first. Carries the raw ECDH shared secret (`Data`), or `nil` on timeout.
+final class UnlockContinuation: @unchecked Sendable {
+    private var inner: CheckedContinuation<Data?, Never>?
+    private let lock = NSLock()
+
+    init(_ continuation: CheckedContinuation<Data?, Never>) {
+        self.inner = continuation
+    }
+
+    func resume(returning value: Data?) {
         lock.withLock {
             guard let c = inner else { return }
             inner = nil

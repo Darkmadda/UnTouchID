@@ -16,6 +16,8 @@ public final class CompanionCoordinator: NSObject, @unchecked Sendable {
     public let challengeHandler: ChallengeHandler
     public let signingProvider: SigningProvider
     public let localAuth: LocalAuthManager
+    /// Key-agreement key for opt-in Mac keychain unlock (separate from signing).
+    public let keyAgreement: KeyAgreementProvider
 
     // Session state
     private var ephemeralPrivateKey: P256.KeyAgreement.PrivateKey?
@@ -38,10 +40,15 @@ public final class CompanionCoordinator: NSObject, @unchecked Sendable {
     // Challenge received while backgrounded — Face ID can't prompt without UI,
     // so it's held here and processed when the app becomes active.
     private var deferredChallenge: Data?
+    /// A keychain-unlock request received while backgrounded, held until active.
+    private var deferredUnlockRequest: Data?
     private var lifecycleObserver: NSObjectProtocol?
 
     /// Signing key tag in Keychain/Secure Enclave.
     private let signingKeyTag = "dev.touchbridge.signing"
+    /// Key-agreement key tag for keychain unlock.
+    private let keychainUnlockKeyTag = "dev.touchbridge.keychain-unlock"
+    private let keychainUnlockEnabledKey = "keychainUnlockEnabled"
 
     public init(
         signingProvider: SigningProvider? = nil,
@@ -53,8 +60,10 @@ public final class CompanionCoordinator: NSObject, @unchecked Sendable {
         // Use real Secure Enclave on device, mock on simulator
         #if targetEnvironment(simulator)
         self.signingProvider = signingProvider ?? MockSigningProvider()
+        self.keyAgreement = MockKeyAgreementProvider()
         #else
         self.signingProvider = signingProvider ?? SecureEnclaveManager()
+        self.keyAgreement = SecureEnclaveKeyAgreement()
         #endif
 
         self.challengeHandler = ChallengeHandler(
@@ -88,10 +97,17 @@ public final class CompanionCoordinator: NSObject, @unchecked Sendable {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self, let data = self.deferredChallenge else { return }
-            self.deferredChallenge = nil
-            UNUserNotificationCenter.current().removeAllDeliveredNotifications()
-            self.processChallenge(data)
+            guard let self else { return }
+            if let data = self.deferredChallenge {
+                self.deferredChallenge = nil
+                UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+                self.processChallenge(data)
+            }
+            if let unlock = self.deferredUnlockRequest {
+                self.deferredUnlockRequest = nil
+                UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+                self.processKeychainUnlockRequest(unlock)
+            }
         }
     }
 
@@ -201,6 +217,12 @@ public final class CompanionCoordinator: NSObject, @unchecked Sendable {
             // This allows the Mac to recognise us as a previously-paired device
             // without going through the full pairing ceremony again.
             sendIdentify(using: crypto)
+
+            // If keychain unlock is on, (re)register our unlock public key so the
+            // Mac can wrap the keychain secret to it.
+            if isKeychainUnlockEnabled {
+                sendKeychainEnroll(using: crypto)
+            }
         } catch {
             logger.error("ECDH failed: \(error.localizedDescription)")
         }
@@ -284,6 +306,94 @@ public final class CompanionCoordinator: NSObject, @unchecked Sendable {
             logger.error("Failed to send pairing request: \(error.localizedDescription)")
         }
     }
+
+    // MARK: - Keychain Unlock (opt-in)
+
+    /// Whether the user has turned on "Unlock Mac keychain".
+    public var isKeychainUnlockEnabled: Bool {
+        UserDefaults.standard.bool(forKey: keychainUnlockEnabledKey)
+    }
+
+    /// Turn on keychain unlock: create the biometric-gated key-agreement key and
+    /// register its public key with the Mac. The user must still run
+    /// `touchbridge-test keychain setup` on the Mac to finish enrollment.
+    public func enableKeychainUnlock() throws {
+        if !keyAgreement.hasKey(tag: keychainUnlockKeyTag) {
+            _ = try keyAgreement.generateKeyPair(tag: keychainUnlockKeyTag)
+        }
+        UserDefaults.standard.set(true, forKey: keychainUnlockEnabledKey)
+        if let crypto = sessionCrypto {
+            sendKeychainEnroll(using: crypto)
+        }
+        logger.info("Keychain unlock enabled")
+    }
+
+    /// Turn off keychain unlock on this phone and destroy the key. The Mac keeps
+    /// its wrapped copy until `keychain setup`/`recover` is run there.
+    public func disableKeychainUnlock() {
+        UserDefaults.standard.set(false, forKey: keychainUnlockEnabledKey)
+        try? keyAgreement.deleteKey(tag: keychainUnlockKeyTag)
+        logger.info("Keychain unlock disabled")
+    }
+
+    /// Send our keychain-unlock public key to the Mac (session-encrypted).
+    /// Wire: [1, 7(keychainEnroll)] + AES-GCM(JSON{deviceID, unlockPublicKey}).
+    private func sendKeychainEnroll(using crypto: SessionCryptoWrapper) {
+        guard let pub = try? keyAgreement.publicKey(for: keychainUnlockKeyTag) else {
+            logger.error("Keychain enroll: no unlock key to export")
+            return
+        }
+        struct EnrollPayload: Codable { let deviceID: String; let unlockPublicKey: Data }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .withoutEscapingSlashes
+            let json = try encoder.encode(EnrollPayload(deviceID: deviceID, unlockPublicKey: pub))
+            let encrypted = try crypto.encrypt(plaintext: json)
+            var wire = Data([1, 7]) // version=1, type=keychainEnroll(7)
+            wire.append(encrypted)
+            _ = bleClient.sendPairingData(wire)
+            logger.info("Sent keychain enroll for device \(self.deviceID)")
+        } catch {
+            logger.error("Failed to send keychain enroll: \(error.localizedDescription)")
+        }
+    }
+
+    /// Handle a keychain-unlock request: biometric-gated ECDH, return the shared
+    /// secret so the Mac can unwrap its keychain password.
+    /// Wire in:  [1, 8] + AES-GCM(JSON{requestID, ephemeralPublicKey, reason})
+    /// Wire out: [1, 9] + AES-GCM(JSON{requestID, sharedSecret})
+    private func processKeychainUnlockRequest(_ data: Data) {
+        Task { @MainActor in
+            guard let crypto = self.sessionCrypto else {
+                self.logger.error("Keychain unlock request but no session")
+                return
+            }
+            guard data.count > 2 else { return }
+            struct ReqPayload: Codable { let requestID: String; let ephemeralPublicKey: Data; let reason: String }
+            struct RespPayload: Codable { let requestID: String; let sharedSecret: Data }
+            do {
+                let plaintext = try crypto.decrypt(ciphertext: Data(data.dropFirst(2)))
+                let req = try JSONDecoder().decode(ReqPayload.self, from: plaintext)
+
+                let shared = try self.keyAgreement.sharedSecret(
+                    tag: self.keychainUnlockKeyTag,
+                    peerPublicKeyX963: req.ephemeralPublicKey,
+                    reason: "TouchBridge: \(req.reason)"
+                )
+
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = .withoutEscapingSlashes
+                let json = try encoder.encode(RespPayload(requestID: req.requestID, sharedSecret: shared))
+                let encrypted = try crypto.encrypt(plaintext: json)
+                var wire = Data([1, 9]) // version=1, type=keychainUnlockResponse(9)
+                wire.append(encrypted)
+                _ = self.bleClient.sendResponse(wire)
+                self.logger.info("Answered keychain unlock request \(req.requestID)")
+            } catch {
+                self.logger.error("Keychain unlock request failed: \(error.localizedDescription)")
+            }
+        }
+    }
 }
 
 // MARK: - BLEClientDelegate
@@ -319,6 +429,21 @@ extension CompanionCoordinator: BLEClientDelegate {
     }
 
     public func bleClient(_ client: BLEClient, didReceiveChallenge data: Data, from peripheralID: UUID) {
+        // The challenge channel also carries keychain-unlock requests (type 8).
+        // Route by the wire type byte before treating it as an auth challenge.
+        if data.count > 1, data[data.startIndex + 1] == 8 {
+            logger.info("Received keychain unlock request from Mac")
+            DispatchQueue.main.async {
+                if UIApplication.shared.applicationState == .active {
+                    self.processKeychainUnlockRequest(data)
+                } else {
+                    self.deferredUnlockRequest = data
+                    self.postChallengeNotification(reason: "unlock your Mac keychain")
+                }
+            }
+            return
+        }
+
         logger.info("Received challenge from Mac")
 
         DispatchQueue.main.async {

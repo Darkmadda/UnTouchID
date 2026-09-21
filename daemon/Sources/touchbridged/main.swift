@@ -185,6 +185,15 @@ struct Serve: ParsableCommand {
 
         coordinator.start()
 
+        // Opt-in: if keychain unlock is set up, proactively unlock the login
+        // keychain via the phone once it connects — so a Face ID at login is
+        // enough and the user needn't lock/unlock the screen first. No-op unless
+        // `touchbridge-test keychain setup` has been run.
+        if coordinator.keychainStore.isActive() {
+            print("Keychain unlock: ENABLED — will unlock the login keychain via your phone at login.")
+            coordinator.startKeychainAutoUnlock()
+        }
+
         // Wait for BLE to be ready, then start advertising
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             coordinator.startAdvertising()

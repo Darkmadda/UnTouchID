@@ -10,7 +10,7 @@ struct TouchBridgeTest: ParsableCommand {
         commandName: "touchbridge-test",
         abstract: "CLI test harness for TouchBridge challenge-response flow.",
         version: "1.0.0",
-        subcommands: [PairCommand.self, ChallengeCommand.self, ListDevicesCommand.self, ConfigCommand.self, LogsCommand.self]
+        subcommands: [PairCommand.self, ChallengeCommand.self, ListDevicesCommand.self, ConfigCommand.self, LogsCommand.self, KeychainCommand.self]
     )
 }
 

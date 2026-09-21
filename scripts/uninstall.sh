@@ -40,6 +40,33 @@ ACTUAL_HOME=$(eval echo "~$ACTUAL_USER")
 ACTUAL_UID=$(id -u "$ACTUAL_USER")
 LAUNCH_AGENT_PLIST="$ACTUAL_HOME/Library/LaunchAgents/dev.touchbridge.daemon.plist"
 
+# --- Keychain-unlock lockout guard ---
+# If the user opted into keychain unlock, their login keychain is decoupled to a
+# RANDOM password. Removing the daemon removes the phone-unlock path, so unless
+# they re-couple first they'd be left with a keychain only the saved random
+# password can open. Warn before touching anything.
+KC_STORE="$ACTUAL_HOME/Library/Application Support/TouchBridge/keychain-unlock.json"
+if [ -f "$KC_STORE" ] && grep -q '"enabled"[[:space:]]*:[[:space:]]*true' "$KC_STORE" 2>/dev/null; then
+    echo ""
+    warn "Keychain unlock is ENABLED on this Mac."
+    echo "  Your login keychain uses a RANDOM password (decoupled from your account"
+    echo "  password). Uninstalling removes the phone-based unlock."
+    echo ""
+    echo "  Recommended BEFORE uninstalling — re-couple the keychain to a password"
+    echo "  you know (run as your user, not root):"
+    echo "      touchbridge-test keychain recover"
+    echo ""
+    echo "  If you skip this, keep the random password from your password manager"
+    echo "  safe — it becomes the only way to unlock the login keychain."
+    echo ""
+    printf "  Continue uninstalling anyway? [y/N] "
+    read -r reply
+    if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+        info "Aborted. Run 'touchbridge-test keychain recover' first, then re-run uninstall."
+        exit 0
+    fi
+fi
+
 # --- Unload LaunchAgent ---
 
 info "Stopping daemon..."

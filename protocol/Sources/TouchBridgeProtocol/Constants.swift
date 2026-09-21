@@ -46,4 +46,9 @@ public enum TouchBridgeConstants {
 
     /// Secure Enclave signing key tag on iOS.
     public static let signingKeyTag = "dev.touchbridge.signing"
+
+    /// Secure Enclave key-agreement key tag on iOS, used only for keychain
+    /// unlock. Kept separate from the signing key so the "unwrap the keychain
+    /// secret" capability is scoped to its own key with its own access control.
+    public static let keychainUnlockKeyTag = "dev.touchbridge.keychain-unlock"
 }

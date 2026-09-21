@@ -56,12 +56,14 @@ class TouchBridgeService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private lateinit var manager: ConnectionManager
     private var lastChallengeShown: String? = null
+    private var lastUnlockShown: String? = null
 
     override fun onCreate() {
         super.onCreate()
         manager = (application as TouchBridgeApp).connectionManager
         startForegroundInternal()
         observeChallenges()
+        observeUnlocks()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -116,6 +118,25 @@ class TouchBridgeService : Service() {
         }
     }
 
+    private fun observeUnlocks() {
+        scope.launch {
+            manager.uiState
+                .distinctUntilChangedBy { it.pendingUnlock?.requestID }
+                .collect { state ->
+                    val unlock = state.pendingUnlock
+                    if (unlock != null && unlock.requestID != lastUnlockShown) {
+                        lastUnlockShown = unlock.requestID
+                        presentPrompt(
+                            "Unlock keychain on ${unlock.macName}",
+                            unlock.reason
+                        )
+                    } else if (unlock == null) {
+                        lastUnlockShown = null
+                    }
+                }
+        }
+    }
+
     /**
      * Launch the biometric prompt. A direct startActivity works when we're
      * already foreground; the full-screen-intent notification is what lets it
@@ -123,6 +144,11 @@ class TouchBridgeService : Service() {
      */
     private fun presentChallenge(challenge: PendingChallenge) {
         Log.i(TAG, "Presenting challenge from ${challenge.macName}: ${challenge.reason}")
+        presentPrompt("Approve sign-in on ${challenge.macName}", challenge.reason)
+    }
+
+    /** Show the full-screen-intent notification that launches [ChallengeActivity]. */
+    private fun presentPrompt(title: String, text: String) {
         val activityIntent = Intent(this, ChallengeActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_HISTORY)
         }
@@ -132,8 +158,8 @@ class TouchBridgeService : Service() {
         )
 
         val notification = NotificationCompat.Builder(this, NotificationHelper.CHANNEL_CHALLENGE)
-            .setContentTitle("Approve sign-in on ${challenge.macName}")
-            .setContentText(challenge.reason)
+            .setContentTitle(title)
+            .setContentText(text)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_CALL)

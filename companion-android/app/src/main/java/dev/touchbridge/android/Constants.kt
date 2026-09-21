@@ -17,6 +17,10 @@ object Constants {
     const val MSG_TYPE_CHALLENGE_RESPONSE: Byte = 4
     const val MSG_TYPE_ERROR: Byte = 5
     const val MSG_TYPE_IDENTIFY: Byte = 6
+    // Opt-in Mac keychain unlock (must match protocol MessageTypes.swift).
+    const val MSG_TYPE_KEYCHAIN_ENROLL: Byte = 7
+    const val MSG_TYPE_KEYCHAIN_UNLOCK_REQUEST: Byte = 8
+    const val MSG_TYPE_KEYCHAIN_UNLOCK_RESPONSE: Byte = 9
 
     // Well-known error code: signing key invalidated (biometric enrollment changed)
     const val ERROR_CODE_KEY_INVALIDATED = 1001
@@ -39,6 +43,8 @@ object Constants {
 
     // Keystore
     const val SIGNING_KEY_ALIAS = "dev.touchbridge.signing"
+    // Key-agreement key for opt-in Mac keychain unlock (API 31+).
+    const val KEYCHAIN_UNLOCK_KEY_ALIAS = "dev.touchbridge.keychain-unlock"
 
     // Preferences
     const val PREFS_NAME = "touchbridge_prefs"
@@ -51,4 +57,6 @@ object Constants {
     const val LEGACY_PREF_PAIRED_SERVICE_UUID = "paired_service_uuid"
     // Stable identifier this device presents to the daemon (generated once).
     const val PREF_DEVICE_ID = "device_id"
+    // Whether the user turned on "Unlock Mac keychain".
+    const val PREF_KEYCHAIN_UNLOCK_ENABLED = "keychain_unlock_enabled"
 }

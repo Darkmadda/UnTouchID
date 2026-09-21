@@ -32,6 +32,12 @@ class TouchBridgeViewModel(app: Application) : AndroidViewModel(app) {
     fun unpair(macId: String) = manager.unpair(macId)
     fun rename(macId: String, nickname: String?) = manager.rename(macId, nickname)
 
+    val keychainUnlockSupported: Boolean get() = manager.keychainUnlockSupported
+    /** Returns false if the key couldn't be created (unsupported / keystore error). */
+    fun setKeychainUnlock(enabled: Boolean): Boolean =
+        if (enabled) manager.enableKeychainUnlock()
+        else { manager.disableKeychainUnlock(); true }
+
     class Factory(private val app: Application) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {

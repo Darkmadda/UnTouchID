@@ -101,6 +101,14 @@ fun HomeScreen(
             Text("Add another Mac")
         }
 
+        if (uiState.isPaired && viewModel.keychainUnlockSupported) {
+            Spacer(modifier = Modifier.height(16.dp))
+            KeychainUnlockCard(
+                enabled = uiState.keychainUnlockEnabled,
+                onToggle = { viewModel.setKeychainUnlock(it) },
+            )
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
 
         // Stats
@@ -280,6 +288,37 @@ private fun RenameMacDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
+}
+
+/**
+ * Toggle for opt-in Mac keychain unlock. Turning it on creates a biometric key
+ * and registers it with paired Macs; the user finishes with `keychain setup`.
+ */
+@Composable
+private fun KeychainUnlockCard(enabled: Boolean, onToggle: (Boolean) -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Unlock Mac keychain", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    Text(
+                        "Approve unlocking your Mac's login keychain from this phone.",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = enabled, onCheckedChange = onToggle)
+            }
+            if (enabled) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "Finish on your Mac: run  touchbridge-test keychain setup",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+    }
 }
 
 @Composable

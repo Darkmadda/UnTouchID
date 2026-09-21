@@ -15,6 +15,7 @@ import dev.touchbridge.android.Constants
 import dev.touchbridge.android.TouchBridgeApp
 import dev.touchbridge.android.core.ConnectionManager
 import dev.touchbridge.android.core.PendingChallenge
+import dev.touchbridge.android.core.PendingUnlock
 import kotlinx.coroutines.launch
 
 /**
@@ -48,14 +49,63 @@ class ChallengeActivity : ComponentActivity() {
         lifecycleScope.launch {
             manager.uiState.collect { state ->
                 val challenge = state.pendingChallenge
-                if (challenge == null) {
-                    finishAndRemoveTask()
-                } else if (challenge.challengeID != promptShownFor) {
-                    promptShownFor = challenge.challengeID
-                    promptFor(challenge)
+                val unlock = state.pendingUnlock
+                when {
+                    challenge != null -> if (challenge.challengeID != promptShownFor) {
+                        promptShownFor = challenge.challengeID
+                        promptFor(challenge)
+                    }
+                    unlock != null -> if (unlock.requestID != promptShownFor) {
+                        promptShownFor = unlock.requestID
+                        promptForUnlock(unlock)
+                    }
+                    else -> finishAndRemoveTask()
                 }
             }
         }
+    }
+
+    private fun promptForUnlock(unlock: PendingUnlock) {
+        val builder = BiometricPrompt.Builder(this)
+            .setTitle("Unlock keychain on ${unlock.macName}")
+            .setSubtitle(unlock.reason)
+            .setDescription("${unlock.macName} is asking to unlock its login keychain.")
+            .setNegativeButton("Deny", mainExecutor) { _, _ -> manager.declineKeychainUnlock() }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.setAllowedAuthenticators(
+                android.hardware.biometrics.BiometricManager.Authenticators.BIOMETRIC_STRONG
+            )
+        }
+        val prompt = builder.build()
+
+        cancellationSignal = CancellationSignal()
+        // Key agreement can't bind to a CryptoObject, so a successful strong
+        // biometric authorises the time-bound key; do the ECDH right after.
+        prompt.authenticate(
+            cancellationSignal!!,
+            mainExecutor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    try {
+                        val shared = manager.keystoreManager.computeSharedSecret(
+                            Constants.KEYCHAIN_UNLOCK_KEY_ALIAS, unlock.ephemeralPublicKey
+                        )
+                        manager.completeKeychainUnlock(unlock.requestID, shared)
+                    } catch (e: KeyPermanentlyInvalidatedException) {
+                        Log.e(TAG, "Keychain-unlock key invalidated", e)
+                        manager.declineKeychainUnlock()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Key agreement failed after biometric auth", e)
+                        manager.declineKeychainUnlock()
+                    }
+                }
+
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
+                    Log.w(TAG, "Keychain unlock biometric error $errorCode: $errString")
+                    manager.declineKeychainUnlock()
+                }
+            }
+        )
     }
 
     private fun promptFor(challenge: PendingChallenge) {

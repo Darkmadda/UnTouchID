@@ -39,6 +39,10 @@ data class TouchBridgeUiState(
     val pairingError: String? = null,
     /** Challenge from a Mac awaiting biometric approval (drives BiometricPrompt). */
     val pendingChallenge: PendingChallenge? = null,
+    /** Keychain-unlock request awaiting biometric approval (drives BiometricPrompt). */
+    val pendingUnlock: PendingUnlock? = null,
+    /** Whether "Unlock Mac keychain" is on. */
+    val keychainUnlockEnabled: Boolean = false,
 ) {
     val isPaired: Boolean get() = macs.isNotEmpty()
     val isConnected: Boolean get() = macs.any { it.isConnected }
@@ -120,6 +124,7 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
                 macs = macs,
                 hasPermissions = hasPerms,
                 statusMessage = statusMessage(macs, hasPerms),
+                keychainUnlockEnabled = prefs.getBoolean(Constants.PREF_KEYCHAIN_UNLOCK_ENABLED, false),
             )
         }
     }
@@ -362,7 +367,118 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
         }
     }
 
+    // MARK: - Keychain unlock (opt-in)
+
+    val isKeychainUnlockEnabled: Boolean
+        get() = prefs.getBoolean(Constants.PREF_KEYCHAIN_UNLOCK_ENABLED, false)
+
+    /** Whether this device can do keychain unlock (needs API 31 for PURPOSE_AGREE_KEY). */
+    val keychainUnlockSupported: Boolean
+        get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+
+    /**
+     * Turn on keychain unlock: create the biometric-gated key-agreement key and
+     * register it with every connected Mac. The user still runs
+     * `touchbridge-test keychain setup` on the Mac to finish.
+     */
+    fun enableKeychainUnlock(): Boolean {
+        if (!keychainUnlockSupported) {
+            Log.w(TAG, "Keychain unlock needs Android 12+ (StrongBox key agreement)")
+            return false
+        }
+        try {
+            if (!keystoreManager.hasKey(Constants.KEYCHAIN_UNLOCK_KEY_ALIAS)) {
+                keystoreManager.generateKeyAgreementKeyPair(Constants.KEYCHAIN_UNLOCK_KEY_ALIAS)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create keychain-unlock key", e)
+            return false
+        }
+        prefs.edit().putBoolean(Constants.PREF_KEYCHAIN_UNLOCK_ENABLED, true).apply()
+        synchronized(lock) { pairedMacs.keys.toList() }.forEach { macId ->
+            if (challengeHandler.isSessionReady(macId)) sendKeychainEnroll(macId)
+        }
+        publish()
+        Log.i(TAG, "Keychain unlock enabled")
+        return true
+    }
+
+    /** Turn off keychain unlock and destroy this phone's key. */
+    fun disableKeychainUnlock() {
+        prefs.edit().putBoolean(Constants.PREF_KEYCHAIN_UNLOCK_ENABLED, false).apply()
+        keystoreManager.deleteKey(Constants.KEYCHAIN_UNLOCK_KEY_ALIAS)
+        publish()
+        Log.i(TAG, "Keychain unlock disabled")
+    }
+
+    /** Decrypt an incoming keychain-unlock request and surface it for biometric approval. */
+    private fun handleKeychainUnlockRequest(macId: String, data: ByteArray) {
+        if (!challengeHandler.isSessionReady(macId) || data.size <= 2) return
+        try {
+            val plaintext = challengeHandler.decrypt(macId, data.copyOfRange(2, data.size))
+            val json = JSONObject(String(plaintext))
+            val unlock = PendingUnlock(
+                macId = macId,
+                macName = macName(macId),
+                requestID = json.getString("requestID"),
+                ephemeralPublicKey = Base64.decode(json.getString("ephemeralPublicKey"), Base64.DEFAULT),
+                reason = json.optString("reason", "unlock your Mac keychain"),
+            )
+            Log.i(TAG, "Keychain unlock request ${unlock.requestID} from ${unlock.macName}")
+            publish { it.copy(pendingUnlock = unlock) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse keychain unlock request", e)
+        }
+    }
+
+    /**
+     * Biometric approved — the caller has already computed the ECDH shared secret
+     * with the keychain-unlock key. Send it back so the Mac can unwrap and unlock.
+     */
+    fun completeKeychainUnlock(requestID: String, sharedSecret: ByteArray) {
+        val unlock = _uiState.value.pendingUnlock?.takeIf { it.requestID == requestID }
+        if (unlock == null) {
+            Log.w(TAG, "Keychain unlock $requestID no longer pending — dropping")
+            return
+        }
+        try {
+            val payload = JSONObject()
+                .put("requestID", requestID)
+                .put("sharedSecret", Base64.encodeToString(sharedSecret, Base64.NO_WRAP))
+                .toString().toByteArray()
+            val wire = byteArrayOf(Constants.PROTOCOL_VERSION, Constants.MSG_TYPE_KEYCHAIN_UNLOCK_RESPONSE) +
+                challengeHandler.encrypt(unlock.macId, payload)
+            bleClient.sendResponse(unlock.macId, wire)
+            Log.i(TAG, "Keychain unlock $requestID answered to ${unlock.macName}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to send keychain unlock response", e)
+        }
+        publish { it.copy(pendingUnlock = null) }
+    }
+
+    /** Biometric denied/cancelled/failed — drop the unlock request. */
+    fun declineKeychainUnlock() {
+        Log.i(TAG, "Keychain unlock declined")
+        publish { it.copy(pendingUnlock = null) }
+    }
+
     // MARK: - Wire messages
+
+    private fun sendKeychainEnroll(macId: String) {
+        try {
+            val publicKey = keystoreManager.getPublicKey(Constants.KEYCHAIN_UNLOCK_KEY_ALIAS)
+            val payload = JSONObject()
+                .put("deviceID", deviceID)
+                .put("unlockPublicKey", Base64.encodeToString(publicKey, Base64.NO_WRAP))
+                .toString().toByteArray()
+            val wire = byteArrayOf(Constants.PROTOCOL_VERSION, Constants.MSG_TYPE_KEYCHAIN_ENROLL) +
+                challengeHandler.encrypt(macId, payload)
+            bleClient.sendPairingData(macId, wire)
+            Log.i(TAG, "Sent keychain enroll for device $deviceID to $macId")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to send keychain enroll", e)
+        }
+    }
 
     private fun sendPairRequest(macId: String, token: ByteArray) {
         try {
@@ -468,10 +584,19 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
             return
         }
         sendIdentify(macId)
+        if (prefs.getBoolean(Constants.PREF_KEYCHAIN_UNLOCK_ENABLED, false)) {
+            sendKeychainEnroll(macId)
+        }
         publish()
     }
 
     override fun onChallengeReceived(macId: String, data: ByteArray) {
+        // The challenge channel also carries keychain-unlock requests (type 8).
+        if (data.size > 1 && data[1] == Constants.MSG_TYPE_KEYCHAIN_UNLOCK_REQUEST) {
+            handleKeychainUnlockRequest(macId, data)
+            return
+        }
+
         val challenge = challengeHandler.parseChallengeWire(macId, macName(macId), data)
         if (challenge == null) {
             Log.w(TAG, "Ignoring unparseable/expired challenge from $macId")

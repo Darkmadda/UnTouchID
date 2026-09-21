@@ -41,6 +41,8 @@ class ChallengeHandler {
 
     fun encrypt(macId: String, plaintext: ByteArray): ByteArray = session(macId).encrypt(plaintext)
 
+    fun decrypt(macId: String, ciphertext: ByteArray): ByteArray = session(macId).decrypt(ciphertext)
+
     /**
      * Parse an incoming challenge wire frame from [macId] and decrypt its nonce.
      *
@@ -109,6 +111,20 @@ class ChallengeHandler {
         }.toString().toByteArray()
         return byteArrayOf(Constants.PROTOCOL_VERSION, Constants.MSG_TYPE_ERROR) + encrypt(macId, payload)
     }
+}
+
+/** A keychain-unlock request from one Mac awaiting biometric approval. */
+data class PendingUnlock(
+    val macId: String,
+    val macName: String,
+    val requestID: String,
+    /** The Mac's ephemeral public key (X9.62) to run ECDH against. */
+    val ephemeralPublicKey: ByteArray,
+    val reason: String,
+) {
+    override fun equals(other: Any?): Boolean =
+        other is PendingUnlock && requestID == other.requestID
+    override fun hashCode(): Int = requestID.hashCode()
 }
 
 /** A decrypted challenge from one Mac awaiting biometric approval. */

@@ -1,15 +1,19 @@
 package dev.touchbridge.android.service
 
+import android.app.KeyguardManager
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import dev.touchbridge.android.R
 import dev.touchbridge.android.TouchBridgeApp
 import dev.touchbridge.android.core.ConnectionManager
@@ -57,6 +61,14 @@ class TouchBridgeService : Service() {
     private lateinit var manager: ConnectionManager
     private var lastChallengeShown: String? = null
     private var lastUnlockShown: String? = null
+
+    /** Set while a prompt is held back until the device is unlocked. */
+    private var pendingActivityIntent: Intent? = null
+    private var unlockReceiver: BroadcastReceiver? = null
+
+    /** Bumped per challenge so each notification/PendingIntent is unique. */
+    private var promptSeq = 0
+    private var lastChallengeNotifId: Int? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -147,16 +159,29 @@ class TouchBridgeService : Service() {
         presentPrompt("Approve sign-in on ${challenge.macName}", challenge.reason)
     }
 
-    /** Show the full-screen-intent notification that launches [ChallengeActivity]. */
+    /** Post the challenge notification and bring up the biometric prompt. */
     private fun presentPrompt(title: String, text: String) {
         val activityIntent = Intent(this, ChallengeActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_HISTORY)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        val fsIntent = PendingIntent.getActivity(
-            this, 1, activityIntent,
+
+        // Each challenge must be a genuinely NEW full-screen-intent notification, or
+        // the OS treats a repost with the same id/PendingIntent as an update and does
+        // NOT re-fire the full-screen intent — so the 2nd+ prompt never launches.
+        // Use a fresh notification id and PendingIntent request code each time, and
+        // cancel the previous one so only one challenge notification is ever shown.
+        promptSeq += 1
+        val notifId = NotificationHelper.NOTIF_ID_CHALLENGE + 1 + promptSeq
+        val tapIntent = PendingIntent.getActivity(
+            this, promptSeq, activityIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // The full-screen intent is what reliably launches ChallengeActivity while
+        // the device is locked (broadcasts like ACTION_USER_PRESENT are not
+        // delivered to us on some OEMs). The activity itself does NOT show the
+        // biometric prompt while locked — it waits until it's focused and unlocked
+        // (see ChallengeActivity.present) — so launching it early is safe.
         val notification = NotificationCompat.Builder(this, NotificationHelper.CHANNEL_CHALLENGE)
             .setContentTitle(title)
             .setContentText(text)
@@ -164,25 +189,80 @@ class TouchBridgeService : Service() {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setAutoCancel(true)
-            .setFullScreenIntent(fsIntent, true)
-            .setContentIntent(fsIntent)
+            .setFullScreenIntent(tapIntent, true)
+            .setContentIntent(tapIntent)
             .build()
 
-        androidx.core.app.NotificationManagerCompat.from(this)
-            .notify(NotificationHelper.NOTIF_ID_CHALLENGE, notification)
+        val nm = androidx.core.app.NotificationManagerCompat.from(this)
+        lastChallengeNotifId?.let { nm.cancel(it) }
+        lastChallengeNotifId = notifId
+        nm.notify(notifId, notification)
 
-        // Also try a direct launch — instant when we're already in the foreground.
+        if (isDeviceLocked()) {
+            // Locked: rely on the full-screen intent to bring up the activity, which
+            // holds the prompt until unlock. Also arm an unlock listener as a
+            // secondary path for OEMs where it is delivered.
+            awaitUnlockThenLaunch(activityIntent)
+        } else {
+            launchPrompt(activityIntent)
+        }
+    }
+
+    /**
+     * Launch the prompt activity now. Instant when we're already foreground; from
+     * the background it succeeds only when the user has granted "Display over other
+     * apps" (which grants a background-activity-launch exemption). Otherwise Android
+     * blocks it and the posted notification remains as the way in.
+     */
+    private fun launchPrompt(activityIntent: Intent) {
         try {
             startActivity(activityIntent)
         } catch (e: Exception) {
-            Log.i(TAG, "Direct activity launch blocked (background) — relying on full-screen intent")
+            if (PermissionUtils.canDrawOverlays(this)) {
+                Log.w(TAG, "Activity launch failed despite overlay permission", e)
+            } else {
+                Log.i(TAG, "Activity launch blocked (background, no overlay permission) — relying on notification")
+            }
         }
+    }
+
+    private fun isDeviceLocked(): Boolean {
+        val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager ?: return false
+        return km.isKeyguardLocked
+    }
+
+    /** Launch [activityIntent] once the device is unlocked (user present). */
+    private fun awaitUnlockThenLaunch(activityIntent: Intent) {
+        pendingActivityIntent = activityIntent
+        if (unlockReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (isDeviceLocked()) return
+                val toLaunch = pendingActivityIntent ?: return
+                pendingActivityIntent = null
+                unregisterUnlockReceiver()
+                launchPrompt(toLaunch)
+            }
+        }
+        unlockReceiver = receiver
+        // ACTION_USER_PRESENT is a protected system broadcast; NOT_EXPORTED is
+        // correct and satisfies the Android 14 registration requirement.
+        ContextCompat.registerReceiver(
+            this, receiver, IntentFilter(Intent.ACTION_USER_PRESENT),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+    }
+
+    private fun unregisterUnlockReceiver() {
+        unlockReceiver?.let { runCatching { unregisterReceiver(it) } }
+        unlockReceiver = null
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         scope.cancel()
+        unregisterUnlockReceiver()
         super.onDestroy()
     }
 }

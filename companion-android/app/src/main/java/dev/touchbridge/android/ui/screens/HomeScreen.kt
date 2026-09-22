@@ -32,6 +32,8 @@ fun HomeScreen(
     modifier: Modifier = Modifier,
     onRequestPermissions: () -> Unit = {},
     onAddMac: () -> Unit = {},
+    canInstantApproval: Boolean = true,
+    onEnableInstantApproval: () -> Unit = {},
 ) {
     var macToUnpair by remember { mutableStateOf<MacStatus?>(null) }
     var macToRename by remember { mutableStateOf<MacStatus?>(null) }
@@ -99,6 +101,11 @@ fun HomeScreen(
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("Add another Mac")
+        }
+
+        if (uiState.isPaired && !canInstantApproval) {
+            Spacer(modifier = Modifier.height(16.dp))
+            InstantApprovalCard(onEnable = onEnableInstantApproval)
         }
 
         if (uiState.isPaired && viewModel.keychainUnlockSupported) {
@@ -288,6 +295,33 @@ private fun RenameMacDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
+}
+
+/**
+ * Prompt to grant "Display over other apps". We don't draw an overlay — the
+ * permission grants a background-activity-launch exemption so the approval prompt
+ * can appear instantly while the app is backgrounded and the device is unlocked.
+ * Shown only while the permission is missing; disappears once granted.
+ */
+@Composable
+private fun InstantApprovalCard(onEnable: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("Instant approval", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+            Text(
+                "Allow TouchBridge to display over other apps so the fingerprint or " +
+                    "face prompt appears instantly, even when the app is in the " +
+                    "background. Without this you'll get a notification to tap first.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Button(onClick = onEnable, modifier = Modifier.fillMaxWidth()) {
+                Text("Enable")
+            }
+        }
+    }
 }
 
 /**

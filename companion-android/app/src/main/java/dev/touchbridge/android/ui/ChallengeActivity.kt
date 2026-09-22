@@ -2,7 +2,10 @@ package dev.touchbridge.android.ui
 
 import android.app.Activity
 import android.app.KeyguardManager
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.hardware.biometrics.BiometricPrompt
 import android.os.Build
 import android.os.Bundle
@@ -10,6 +13,7 @@ import android.os.CancellationSignal
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import dev.touchbridge.android.Constants
 import dev.touchbridge.android.TouchBridgeApp
@@ -38,11 +42,19 @@ class ChallengeActivity : ComponentActivity() {
     private var cancellationSignal: CancellationSignal? = null
     private var promptShownFor: String? = null
 
+    /** A prompt held back because the device is locked; run once it's unlocked. */
+    private var pendingPresentation: (() -> Unit)? = null
+    private var unlockReceiver: BroadcastReceiver? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         manager = (application as TouchBridgeApp).connectionManager
 
-        showWhenLockedAndTurnScreenOn()
+        // Deliberately do NOT show over / dismiss the keyguard. When the device is
+        // locked we let this (transparent) activity sit *behind* the lock screen and
+        // defer the biometric prompt until the user unlocks normally — see present().
+        // Showing over the keyguard caused the prompt to be cancelled mid-unlock and
+        // left a blank wallpaper the user was stuck on.
 
         // Finish automatically once the challenge is resolved (approved, denied,
         // or expired-and-cleared by a newer one).
@@ -51,18 +63,95 @@ class ChallengeActivity : ComponentActivity() {
                 val challenge = state.pendingChallenge
                 val unlock = state.pendingUnlock
                 when {
-                    challenge != null -> if (challenge.challengeID != promptShownFor) {
-                        promptShownFor = challenge.challengeID
-                        promptFor(challenge)
+                    challenge != null -> present(challenge.challengeID) { promptFor(challenge) }
+                    unlock != null -> present(unlock.requestID) { promptForUnlock(unlock) }
+                    else -> {
+                        // Nothing pending (resolved or expired) — drop any deferred
+                        // prompt and close.
+                        pendingPresentation = null
+                        finishAndRemoveTask()
                     }
-                    unlock != null -> if (unlock.requestID != promptShownFor) {
-                        promptShownFor = unlock.requestID
-                        promptForUnlock(unlock)
-                    }
-                    else -> finishAndRemoveTask()
                 }
             }
         }
+    }
+
+    /**
+     * Show the biometric prompt for [id] — but only while the device is unlocked.
+     *
+     * If the phone is locked, the OS cancels a biometric prompt the instant the
+     * user starts unlocking (firing onAuthenticationError, which declines and
+     * clears the request), so it flashes up and then there's nothing left to
+     * approve. Instead we defer the prompt until the device is unlocked
+     * (ACTION_USER_PRESENT, or the next resume as a fallback).
+     */
+    private fun present(id: String, show: () -> Unit) {
+        if (id == promptShownFor) return
+        promptShownFor = id
+        if (isDeviceLocked()) {
+            pendingPresentation = show
+            registerUnlockReceiver()
+        } else {
+            show()
+        }
+    }
+
+    private fun isDeviceLocked(): Boolean {
+        val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager ?: return false
+        return km.isKeyguardLocked
+    }
+
+    /**
+     * Show a held-back prompt if we're ready.
+     *
+     * [focused] is the authoritative signal: this activity is not shown over the
+     * keyguard, so once it has window focus the keyguard is gone — even if
+     * `isKeyguardLocked()` still momentarily reports locked mid-dismiss (that race
+     * is exactly what previously left the prompt stuck). For callers without
+     * guaranteed focus (onResume / USER_PRESENT) we fall back to the keyguard check.
+     */
+    private fun presentDeferred(focused: Boolean) {
+        val show = pendingPresentation ?: return
+        if (!focused && isDeviceLocked()) return
+        pendingPresentation = null
+        unregisterUnlockReceiver()
+        show()
+    }
+
+    private fun registerUnlockReceiver() {
+        if (unlockReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                presentDeferred(focused = hasWindowFocus())
+            }
+        }
+        unlockReceiver = receiver
+        // ACTION_USER_PRESENT is a protected system broadcast; NOT_EXPORTED is
+        // correct and satisfies the Android 14 registration requirement.
+        ContextCompat.registerReceiver(
+            this, receiver, IntentFilter(Intent.ACTION_USER_PRESENT),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+    }
+
+    private fun unregisterUnlockReceiver() {
+        unlockReceiver?.let { runCatching { unregisterReceiver(it) } }
+        unlockReceiver = null
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // If we're already focused (unlocked), show now; otherwise fall back to the
+        // keyguard check in case focus hasn't been reported yet.
+        presentDeferred(focused = hasWindowFocus())
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // The reliable signal on OEMs that don't broadcast ACTION_USER_PRESENT:
+        // gaining window focus means the keyguard is gone (this activity is not
+        // shown over it), so it's safe to show the prompt.
+        if (hasFocus) presentDeferred(focused = true)
     }
 
     private fun promptForUnlock(unlock: PendingUnlock) {
@@ -158,23 +247,9 @@ class ChallengeActivity : ComponentActivity() {
         )
     }
 
-    private fun showWhenLockedAndTurnScreenOn() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-            setShowWhenLocked(true)
-            setTurnScreenOn(true)
-            (getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)
-                ?.requestDismissKeyguard(this, null)
-        } else {
-            @Suppress("DEPRECATION")
-            window.addFlags(
-                android.view.WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                    android.view.WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
-            )
-        }
-    }
-
     override fun onDestroy() {
         cancellationSignal?.cancel()
+        unregisterUnlockReceiver()
         super.onDestroy()
     }
 }

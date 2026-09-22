@@ -24,6 +24,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Show the approval prompt over the lock screen / other apps -->
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Grants a background-activity-launch exemption so the approval prompt can
+         appear instantly while the app is backgrounded and the device is unlocked.
+         Opt-in; not required — without it we fall back to a tappable notification. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
@@ -50,15 +54,14 @@
             </intent-filter>
         </activity>
 
-        <!-- Transparent activity that shows the biometric prompt, including over
-             the lock screen when launched by the service's full-screen intent -->
+        <!-- Transparent activity that shows the biometric prompt. When the device
+             is locked it is launched behind the keyguard and waits for the user to
+             unlock (it does NOT show over the lock screen), then shows the prompt. -->
         <activity
             android:name=".ui.ChallengeActivity"
             android:exported="false"
             android:excludeFromRecents="true"
             android:launchMode="singleInstance"
-            android:showWhenLocked="true"
-            android:turnScreenOn="true"
             android:taskAffinity=".ChallengeTask"
             android:theme="@style/Theme.TouchBridge.Transparent" />
 

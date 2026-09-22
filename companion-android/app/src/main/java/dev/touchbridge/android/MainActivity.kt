@@ -21,11 +21,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.touchbridge.android.service.TouchBridgeService
 import dev.touchbridge.android.ui.screens.*
@@ -43,6 +45,29 @@ class MainActivity : ComponentActivity() {
                 )
                 val uiState by viewModel.uiState.collectAsState()
                 val context = LocalContext.current
+                val lifecycleOwner = LocalLifecycleOwner.current
+
+                // "Display over other apps" is a special permission granted from a
+                // settings screen, so re-check it whenever we come back to the app.
+                var canInstantApproval by remember {
+                    mutableStateOf(PermissionUtils.canDrawOverlays(context))
+                }
+                DisposableEffect(lifecycleOwner) {
+                    val observer = LifecycleEventObserver { _, event ->
+                        if (event == Lifecycle.Event.ON_RESUME) {
+                            canInstantApproval = PermissionUtils.canDrawOverlays(context)
+                        }
+                    }
+                    lifecycleOwner.lifecycle.addObserver(observer)
+                    onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+                }
+                val enableInstantApproval = {
+                    try {
+                        context.startActivity(PermissionUtils.overlaySettingsIntent(context))
+                    } catch (e: Exception) {
+                        // Some OEMs don't expose this screen — the user can set it manually.
+                    }
+                }
 
                 val permissionLauncher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -90,7 +115,9 @@ class MainActivity : ComponentActivity() {
                         MainScreen(
                             viewModel = viewModel,
                             uiState = uiState,
-                            onRequestPermissions = requestPermissions
+                            onRequestPermissions = requestPermissions,
+                            canInstantApproval = canInstantApproval,
+                            onEnableInstantApproval = enableInstantApproval
                         )
                     } else {
                         OnboardingScreen(
@@ -125,7 +152,9 @@ private fun requestBatteryExemption(context: Context) {
 fun MainScreen(
     viewModel: TouchBridgeViewModel,
     uiState: TouchBridgeUiState,
-    onRequestPermissions: () -> Unit = {}
+    onRequestPermissions: () -> Unit = {},
+    canInstantApproval: Boolean = true,
+    onEnableInstantApproval: () -> Unit = {}
 ) {
     var addingMac by rememberSaveable { mutableStateOf(false) }
 
@@ -135,30 +164,7 @@ fun MainScreen(
         if (addingMac) viewModel.resetPairing()
     }
 
-    Scaffold(
-        bottomBar = {
-            NavigationBar {
-                NavigationBarItem(
-                    selected = true,
-                    onClick = { },
-                    icon = { Icon(painter = painterResource(android.R.drawable.ic_lock_idle_lock), "Home") },
-                    label = { Text("Home") }
-                )
-                NavigationBarItem(
-                    selected = false,
-                    onClick = { },
-                    icon = { Icon(painter = painterResource(android.R.drawable.ic_menu_recent_history), "Activity") },
-                    label = { Text("Activity") }
-                )
-                NavigationBarItem(
-                    selected = false,
-                    onClick = { },
-                    icon = { Icon(painter = painterResource(android.R.drawable.ic_menu_preferences), "Settings") },
-                    label = { Text("Settings") }
-                )
-            }
-        }
-    ) { padding ->
+    Scaffold { padding ->
         if (addingMac) {
             Column(
                 modifier = Modifier
@@ -181,7 +187,9 @@ fun MainScreen(
                 uiState = uiState,
                 modifier = Modifier.padding(padding),
                 onRequestPermissions = onRequestPermissions,
-                onAddMac = { addingMac = true }
+                onAddMac = { addingMac = true },
+                canInstantApproval = canInstantApproval,
+                onEnableInstantApproval = onEnableInstantApproval
             )
         }
     }

@@ -156,6 +156,26 @@ chown root:wheel "$AUTOLOCK_TOOL"
 chmod 755 "$AUTOLOCK_TOOL"
 info "Installed $AUTOLOCK_TOOL"
 
+# touchbridge-test: the pairing/challenge/logs CLI. The menu-bar app shells out
+# to it for pairing, so it must be on PATH for the GUI flow to work.
+TEST_BUILD="$PROJECT_DIR/daemon/.build/release/touchbridge-test"
+TEST_BIN="/usr/local/bin/touchbridge-test"
+if [ -f "$TEST_BUILD" ]; then
+    install_fresh "$TEST_BUILD" "$TEST_BIN"
+    chown root:wheel "$TEST_BIN"
+    chmod 755 "$TEST_BIN"
+    # Ad-hoc sign so Bluetooth (TCC) permission attaches to a stable identity
+    # across rebuilds, the same way the daemon binary is signed.
+    if [ -n "${TB_CODESIGN_IDENTITY:-}" ]; then
+        codesign --force --sign "$TB_CODESIGN_IDENTITY" "$TEST_BIN" 2>/dev/null || true
+    else
+        codesign --force --sign - "$TEST_BIN" 2>/dev/null || true
+    fi
+    info "Installed $TEST_BIN"
+else
+    warn "touchbridge-test binary not found at $TEST_BUILD — pairing from the menu app will not work."
+fi
+
 info "Installing PAM module..."
 mkdir -p "$(dirname "$PAM_LIB")"
 install_fresh "$PAM_BUILD" "$PAM_LIB"
@@ -254,6 +274,58 @@ chmod 644 "$LAUNCH_AGENT_PLIST"
 launchctl bootstrap "gui/$ACTUAL_UID" "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
 launchctl kickstart -k "gui/$ACTUAL_UID/$LAUNCH_AGENT_LABEL" 2>/dev/null || true
 info "LaunchAgent installed and started."
+
+# --- Install Menu-Bar App ---
+# Builds TouchBridgeMenu.app (swiftc, no Xcode project needed), installs it to
+# /Applications, and adds a per-user LaunchAgent so it starts at login. The app
+# is a plain accessory (menu-bar) UI for start/stop, pairing, settings and
+# unpairing — quitting it from the menu keeps it quit (no KeepAlive).
+
+MENU_APP_SRC="$PROJECT_DIR/menubar/build/TouchBridgeMenu.app"
+MENU_APP_DST="/Applications/TouchBridge.app"
+MENU_LABEL="dev.touchbridge.menubar"
+MENU_PLIST="$ACTUAL_HOME/Library/LaunchAgents/$MENU_LABEL.plist"
+MENU_BIN="$MENU_APP_DST/Contents/MacOS/TouchBridgeMenu"
+
+info "Building menu-bar app..."
+sudo -u "$ACTUAL_USER" bash "$PROJECT_DIR/menubar/build.sh" 2>&1 | tail -1
+
+if [ -d "$MENU_APP_SRC" ]; then
+    # Stop any running/old instance before replacing the bundle.
+    launchctl bootout "gui/$ACTUAL_UID/$MENU_LABEL" 2>/dev/null || true
+    sudo -u "$ACTUAL_USER" pkill -x TouchBridgeMenu 2>/dev/null || true
+    rm -rf "$MENU_APP_DST"
+    cp -R "$MENU_APP_SRC" "$MENU_APP_DST"
+    info "Installed $MENU_APP_DST"
+
+    cat > "$MENU_PLIST" << MENUPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$MENU_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$MENU_BIN</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+MENUPLIST
+    chown "$ACTUAL_USER" "$MENU_PLIST"
+    chmod 644 "$MENU_PLIST"
+
+    launchctl bootstrap "gui/$ACTUAL_UID" "$MENU_PLIST" 2>/dev/null || true
+    launchctl kickstart -k "gui/$ACTUAL_UID/$MENU_LABEL" 2>/dev/null || true
+    info "Menu-bar app installed and started (look for the TouchBridge icon in your menu bar)."
+else
+    warn "Menu-bar app build not found at $MENU_APP_SRC — skipping."
+    warn "Build it manually with: bash menubar/build.sh"
+fi
 
 # --- Verification ---
 

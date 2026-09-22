@@ -51,7 +51,16 @@ struct PairCommand: ParsableCommand {
     @Option(name: .long, help: "Timeout in seconds to wait for pairing (default: 300).")
     var timeout: Int = 300
 
+    @Flag(name: .long, help: "Don't open the QR image in Preview. For GUI front-ends (e.g. the menu-bar app) that render the QR themselves.")
+    var noOpen: Bool = false
+
     func run() throws {
+        // Unbuffer stdout so a parent process (the menu-bar app) receives the
+        // pairing payload the instant it is printed, instead of whenever the
+        // pipe's block buffer happens to flush — otherwise the GUI sits on an
+        // empty QR placeholder while this process blocks waiting for the phone.
+        setvbuf(stdout, nil, _IONBF, 0)
+
         let deviceStore = PairedDeviceStore.standard()
         // Use the daemon's per-Mac service UUID so the printed payload and this
         // process's advertisement match what the installed daemon advertises —
@@ -79,7 +88,7 @@ struct PairCommand: ParsableCommand {
                     print("=== TouchBridge Pairing ===")
                     print("")
 
-                    if let qrURL = Self.writeQRImage(qrData) {
+                    if !noOpen, let qrURL = Self.writeQRImage(qrData) {
                         print("Opening QR code — scan it with the TouchBridge app on your iPhone.")
                         print("  (\(qrURL.path))")
                         let open = Process()
@@ -93,6 +102,10 @@ struct PairCommand: ParsableCommand {
                     print("")
                     print(jsonString)
                     print("")
+
+                    // Stable, single-line marker for GUI front-ends to parse.
+                    // The payload is compact JSON (no embedded newlines).
+                    print("TB_PAIRING_PAYLOAD=\(jsonString)")
                 }
             } catch {
                 print("Error generating pairing data: \(error)")

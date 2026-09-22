@@ -79,6 +79,25 @@ else
     info "LaunchAgent plist not found — skipping."
 fi
 
+# --- Remove Menu-Bar App ---
+
+MENU_LABEL="dev.touchbridge.menubar"
+MENU_PLIST="$ACTUAL_HOME/Library/LaunchAgents/$MENU_LABEL.plist"
+MENU_APP_DST="/Applications/TouchBridge.app"
+
+info "Stopping menu-bar app..."
+launchctl bootout "gui/$ACTUAL_UID/$MENU_LABEL" 2>/dev/null || true
+sudo -u "$ACTUAL_USER" pkill -x TouchBridgeMenu 2>/dev/null || true
+
+if [ -f "$MENU_PLIST" ]; then
+    rm -f "$MENU_PLIST"
+    info "Removed menu-bar app LaunchAgent."
+fi
+if [ -d "$MENU_APP_DST" ]; then
+    rm -rf "$MENU_APP_DST"
+    info "Removed $MENU_APP_DST"
+fi
+
 # --- Remove PAM hook (BEFORE the module, to avoid a dangling reference) ---
 
 tb_disable_sudo
@@ -98,6 +117,12 @@ AUTOLOCK_TOOL="/usr/local/bin/touchbridge-autolock"
 if [ -f "$AUTOLOCK_TOOL" ]; then
     rm -f "$AUTOLOCK_TOOL"
     info "Removed $AUTOLOCK_TOOL"
+fi
+
+TEST_BIN="/usr/local/bin/touchbridge-test"
+if [ -f "$TEST_BIN" ]; then
+    rm -f "$TEST_BIN"
+    info "Removed $TEST_BIN"
 fi
 
 if [ -f "$PAM_LIB" ]; then

@@ -1,126 +1,159 @@
 import SwiftUI
 
+/// The dropdown shown when the menu-bar icon is clicked: live status plus the
+/// core actions — start/stop the service, pair a device, open settings, manage
+/// paired devices, and quit.
 struct MenuBarView: View {
     @ObservedObject var state: MenuBarState
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header
-            HStack {
-                Image(systemName: "touchid")
-                    .font(.title2)
-                    .foregroundStyle(state.isConnected ? .green : .secondary)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("TouchBridge")
-                        .font(.headline)
-                    Text(statusText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-
+            header
             Divider()
 
-            // Connection status
-            if let device = state.pairedDeviceName {
-                HStack {
-                    Circle()
-                        .fill(state.isConnected ? .green : .orange)
-                        .frame(width: 8, height: 8)
-                    Text(device)
-                        .font(.subheadline)
-                    Spacer()
-                    Text(state.isConnected ? "Connected" : "Disconnected")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-
+            if state.isInstalled {
+                statusRow
                 Divider()
+                actions
+            } else {
+                notInstalled
             }
 
-            // Recent auth events
-            if !state.recentEvents.isEmpty {
-                Text("Recent Activity")
+            Divider()
+            MenuRow(title: "Quit TouchBridge", systemImage: "power") {
+                NSApplication.shared.terminate(nil)
+            }
+        }
+        .frame(width: 300)
+        .padding(.vertical, 6)
+    }
+
+    // MARK: - Header
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "touchid")
+                .font(.title2)
+                .foregroundStyle(state.isDaemonRunning ? .green : .secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("TouchBridge").font(.headline)
+                Text(statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
-                    .padding(.bottom, 4)
-
-                ForEach(state.recentEvents.prefix(5)) { event in
-                    HStack {
-                        Image(systemName: event.result == "VERIFIED" ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(event.result == "VERIFIED" ? .green : .red)
-                            .font(.caption)
-                        Text(event.surface)
-                            .font(.caption)
-                        Spacer()
-                        Text(formatTime(event.ts))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 2)
-                }
-
-                Divider()
-                    .padding(.top, 4)
             }
-
-            // Actions
-            if !state.isInstalled {
-                Button {
-                    // Open setup wizard
-                    NSApp.activate(ignoringOtherApps: true)
-                } label: {
-                    Label("Set Up TouchBridge...", systemImage: "arrow.right.circle")
-                }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-            }
-
-            Button {
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-            } label: {
-                Label("Settings...", systemImage: "gear")
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 6)
-
-            Divider()
-
-            Button {
-                NSApplication.shared.terminate(nil)
-            } label: {
-                Text("Quit TouchBridge")
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            Spacer()
+            if state.isBusy { ProgressView().controlSize(.small) }
         }
-        .frame(width: 280)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
     }
+
+    private var statusRow: some View {
+        HStack {
+            Circle()
+                .fill(state.isDaemonRunning ? .green : .orange)
+                .frame(width: 8, height: 8)
+            Text(state.isDaemonRunning ? "Service running" : "Service stopped")
+                .font(.subheadline)
+            Spacer()
+            Text(pairedSummary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+
+    // MARK: - Actions
+
+    private var actions: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            MenuRow(
+                title: state.isDaemonRunning ? "Stop Service" : "Start Service",
+                systemImage: state.isDaemonRunning ? "stop.circle" : "play.circle"
+            ) {
+                state.toggleDaemon()
+            }
+            .disabled(state.isBusy)
+
+            MenuRow(title: "Pair New Device…", systemImage: "iphone.radiowaves.left.and.right") {
+                AppWindows.shared.showPairing(state)
+            }
+            .disabled(state.isBusy)
+
+            MenuRow(
+                title: state.pairedDevices.isEmpty ? "Paired Devices…" : "Paired Devices (\(state.pairedDevices.count))…",
+                systemImage: "list.bullet"
+            ) {
+                AppWindows.shared.showSettings(state, tab: .devices)
+            }
+
+            MenuRow(title: "Keychain Unlock…", systemImage: "key") {
+                AppWindows.shared.showSettings(state, tab: .keychain)
+            }
+
+            MenuRow(title: "Settings…", systemImage: "gearshape") {
+                AppWindows.shared.showSettings(state, tab: .general)
+            }
+        }
+    }
+
+    private var notInstalled: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("TouchBridge isn't installed yet.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+            MenuRow(title: "Set Up TouchBridge…", systemImage: "arrow.right.circle") {
+                AppWindows.shared.showSetup(state)
+            }
+        }
+    }
+
+    // MARK: - Copy
 
     private var statusText: String {
         if !state.isInstalled { return "Not installed" }
-        if !state.isDaemonRunning { return "Daemon not running" }
-        if state.isConnected { return "Ready — phone connected" }
-        return "Waiting for phone..."
+        if state.isBusy { return "Working…" }
+        return state.isDaemonRunning ? "Ready" : "Stopped"
     }
 
-    private func formatTime(_ iso: String) -> String {
-        let parts = iso.split(separator: "T")
-        if parts.count == 2 {
-            let time = parts[1].prefix(5)
-            return String(time)
+    private var pairedSummary: String {
+        switch state.pairedDevices.count {
+        case 0: return "No devices"
+        case 1: return "1 device"
+        case let n: return "\(n) devices"
         }
-        return iso
+    }
+}
+
+/// A full-width, hover-highlighted menu row that looks native inside a
+/// `.window`-style `MenuBarExtra`.
+struct MenuRow: View {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+
+    @State private var hovering = false
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .frame(width: 18)
+                    .foregroundStyle(isEnabled ? .primary : .tertiary)
+                Text(title)
+                    .foregroundStyle(isEnabled ? .primary : .tertiary)
+                Spacer()
+            }
+            .contentShape(Rectangle())
+            .padding(.horizontal, 16)
+            .padding(.vertical, 7)
+            .background(hovering && isEnabled ? Color.accentColor.opacity(0.15) : .clear)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }

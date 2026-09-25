@@ -174,7 +174,7 @@ struct Serve: ParsableCommand {
         }
 
         // Start Unix domain socket server for PAM module communication
-        let socketServer = SocketServer(authHandler: coordinator, policyEngine: policyEngine)
+        let socketServer = SocketServer(authHandler: coordinator, keychainHandler: coordinator, policyEngine: policyEngine)
         do {
             try socketServer.start()
             print("Socket server listening on \(socketServer.path)")

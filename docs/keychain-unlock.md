@@ -26,6 +26,32 @@ changes the security model — read "Security & tradeoffs" before enabling it.**
   connects, so a single Face ID at login unlocks the keychain — no lock/unlock
   dance. (The phone must be reachable and, if backgrounded, tapped via the
   notification so it can show Face ID.)
+- After a **screen unlock**, the daemon repeats the handshake so the keychain
+  unlocks in lock-step. The companion routinely drops and re-establishes the BLE
+  link the instant the screen unlocks, so the daemon waits briefly (a few
+  seconds) for the phone — or any enrolled phone — to be reachable rather than
+  firing once and giving up. Every attempt is recorded in the audit log.
+
+## Manual unlock (menu bar)
+
+The keychain doesn't always unlock automatically — the phone may be out of range,
+backgrounded, or the BLE link may not have re-established in time. The menu-bar
+app shows the live keychain state (**Keychain locked / unlocked**) and, when
+locked, an **Unlock Keychain Now** button that triggers the same phone handshake
+on demand (Face ID on the phone). It talks to the running daemon over the local
+`daemon.sock`; the outcome is reported inline in the menu.
+
+If an automatic unlock ever fails to land, watch why:
+
+```bash
+tail -f "$HOME/Library/Logs/TouchBridge/touchbridge-$(date +%F).ndjson" | grep keychain_unlock
+```
+
+`keychain_unlock` results: `UNLOCKED` (success), `FAILED_NO_DEVICE` (no enrolled
+phone was reachable in the wait window), `FAILED_SEND` (couldn't notify the
+phone), `FAILED_TIMEOUT` (phone didn't answer — often the second Face ID prompt
+was missed), `FAILED_NO_SESSION` / `FAILED_NO_SECRET` / `FAILED_UNWRAP`
+(handshake/state problems).
 
 ## Enable it
 

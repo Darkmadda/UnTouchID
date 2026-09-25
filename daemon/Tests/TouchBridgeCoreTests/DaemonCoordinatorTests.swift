@@ -1180,7 +1180,7 @@ private func lastUnlockRequest(_ bleServer: MockBLEServer) -> (data: Data, centr
         forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
     #expect(keychainStore.isActive())
 
-    async let done: Void = coordinator.performKeychainUnlock(
+    async let done: KeychainUnlockOutcome = coordinator.performKeychainUnlock(
         centralID: companion.centralID, deviceID: companion.deviceID, reason: "test")
 
     try await Task.sleep(nanoseconds: 150_000_000)
@@ -1290,4 +1290,56 @@ private func lastUnlockRequest(_ bleServer: MockBLEServer) -> (data: Data, centr
     try await Task.sleep(nanoseconds: 200_000_000)
     #expect(lastUnlockRequest(bleServer) == nil)   // sudo must not unlock the keychain
     #expect(unlocker.unlockedWith.isEmpty)
+}
+
+@Test func onDemandUnlockHappyPath() async throws {
+    let (coordinator, bleServer, deviceStore, keychainStore, unlocker) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    let randomPW = "manual-unlock-pw"
+    let wrapped = try KeychainSecretCrypto.wrap(
+        secret: Data(randomPW.utf8), recipientPublicKey: companion.keychainUnlockPublicKeyData())
+    try keychainStore.setWrappedSecret(
+        forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
+
+    // The menu-bar button path: no PAM auth, no pre-selected winner.
+    async let outcome: KeychainUnlockOutcome =
+        coordinator.requestKeychainUnlock(reason: "manual", waitForDevice: 3)
+
+    try await Task.sleep(nanoseconds: 200_000_000)
+    guard let req = lastUnlockRequest(bleServer) else {
+        Issue.record("On-demand unlock sent no request"); return
+    }
+    bleServer.simulateResponse(try companion.respondToKeychainUnlockRequest(req.data), from: companion.centralID)
+
+    #expect(await outcome == .unlocked)
+    #expect(unlocker.unlockedWith == [randomPW])
+    #expect(unlocker.isLockedNow == false)
+}
+
+@Test func onDemandUnlockReportsNoDeviceWhenNonePresent() async throws {
+    let (coordinator, _, _, keychainStore, unlocker) = makeKeychainCoordinator()
+    // Set up the feature but connect no phone.
+    let companion = CompanionSimulator()
+    try keychainStore.upsertEnrollment(
+        deviceID: companion.deviceID, displayName: "Test",
+        unlockPublicKey: companion.keychainUnlockPublicKeyData())
+    let wrapped = try KeychainSecretCrypto.wrap(
+        secret: Data("pw".utf8), recipientPublicKey: companion.keychainUnlockPublicKeyData())
+    try keychainStore.setWrappedSecret(
+        forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
+
+    let outcome = await coordinator.requestKeychainUnlock(reason: "manual", waitForDevice: 1)
+    #expect(outcome == .noDeviceConnected)
+    #expect(unlocker.unlockedWith.isEmpty)
+}
+
+@Test func onDemandUnlockNotConfigured() async throws {
+    let (coordinator, _, _, _, _) = makeKeychainCoordinator()
+    // Nothing set up at all.
+    let outcome = await coordinator.requestKeychainUnlock(reason: "manual", waitForDevice: 1)
+    #expect(outcome == .notConfigured)
 }

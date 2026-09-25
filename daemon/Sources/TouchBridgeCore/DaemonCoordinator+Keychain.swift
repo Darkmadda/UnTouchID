@@ -2,6 +2,20 @@ import Foundation
 import CryptoKit
 import TouchBridgeProtocol
 
+/// The result of an attempt to unlock the login keychain via a phone.
+public enum KeychainUnlockOutcome: Sendable, Equatable {
+    /// The keychain was locked and is now unlocked.
+    case unlocked
+    /// The keychain was already unlocked — nothing to do.
+    case alreadyUnlocked
+    /// The feature isn't set up (`keychain-setup` hasn't run).
+    case notConfigured
+    /// No enrolled phone was connected/reachable within the wait window.
+    case noDeviceConnected
+    /// The handshake or unlock failed; the string is a short machine reason.
+    case failed(String)
+}
+
 /// Opt-in keychain unlock: after a phone approves a screen/login unlock, the
 /// daemon asks it to unwrap the (decoupled, random) login-keychain password so
 /// the keychain unlocks in lock-step with the session — the behaviour Touch ID
@@ -85,12 +99,71 @@ extension DaemonCoordinator {
 
     /// After a verified screen/login auth, unlock the keychain if configured and
     /// currently locked. Never blocks the auth path (called from a detached Task).
+    ///
+    /// The companion routinely drops and re-establishes the BLE link right after a
+    /// screen unlock, so the session that answered the challenge is often gone by
+    /// the time this runs. Rather than fire once at that exact session and give up
+    /// silently, prefer it but wait briefly for it (or any enrolled phone) to be
+    /// reachable — and audit the give-up so the failure is diagnosable.
     func unlockKeychainAfterAuth(service: String, winner: AuthWinner) async {
         guard Self.keychainUnlockServices.contains(service) else { return }
-        guard keychainStore.isActive() else { return }
-        await performKeychainUnlock(centralID: winner.centralID,
-                                    deviceID: winner.deviceID,
-                                    reason: "unlock your Mac keychain")
+        guard keychainStore.isActive(), let path = keychainStore.keychainPath() else { return }
+        // Already unlocked (the common case while actively using the Mac) — silent no-op.
+        if (try? keychainUnlocker.isLocked(path: path)) == false { return }
+
+        guard let target = await waitForEnrolledTarget(preferred: winner.centralID, timeout: 8) else {
+            logger.warning("Keychain unlock after auth: no enrolled phone reachable (winner \(winner.deviceID))")
+            await auditLog.log(AuditEntry(sessionID: UUID().uuidString, surface: "keychain_unlock",
+                                          deviceID: winner.deviceID, result: "FAILED_NO_DEVICE"))
+            return
+        }
+        _ = await performKeychainUnlock(centralID: target.centralID,
+                                        deviceID: target.deviceID,
+                                        reason: "unlock your Mac keychain")
+    }
+
+    /// On-demand keychain unlock (menu-bar "Unlock Keychain Now", or any caller
+    /// that isn't tied to a specific PAM auth). Waits up to `waitForDevice` for an
+    /// enrolled phone to be reachable, then runs the handshake. Every outcome —
+    /// including "no phone connected" — is reported and audited.
+    public func requestKeychainUnlock(reason: String, waitForDevice: TimeInterval) async -> KeychainUnlockOutcome {
+        guard keychainStore.isActive(), let path = keychainStore.keychainPath() else {
+            return .notConfigured
+        }
+        if (try? keychainUnlocker.isLocked(path: path)) == false {
+            return .alreadyUnlocked
+        }
+        guard let target = await waitForEnrolledTarget(preferred: nil, timeout: waitForDevice) else {
+            logger.warning("Keychain unlock (on demand): no enrolled phone connected")
+            await auditLog.log(AuditEntry(sessionID: UUID().uuidString, surface: "keychain_unlock",
+                                          result: "FAILED_NO_DEVICE"))
+            return .noDeviceConnected
+        }
+        return await performKeychainUnlock(centralID: target.centralID,
+                                           deviceID: target.deviceID,
+                                           reason: reason)
+    }
+
+    /// Poll for a connected, identified phone that has a wrapped secret ready, up
+    /// to `timeout`. If `preferred` is given and becomes ready it wins; otherwise
+    /// the first ready phone does. Returns nil if none appears in time.
+    func waitForEnrolledTarget(preferred: UUID?, timeout: TimeInterval) async -> AuthWinner? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let ready: [AuthWinner] = stateLock.withLock {
+                sessions.compactMap { (centralID, state) in
+                    guard state.sessionCrypto != nil, let deviceID = state.deviceID else { return nil }
+                    return (centralID: centralID, deviceID: deviceID)
+                }
+            }.filter { keychainStore.wrappedSecret(forDeviceID: $0.deviceID) != nil }
+
+            if let preferred, let match = ready.first(where: { $0.centralID == preferred }) {
+                return match
+            }
+            if let first = ready.first { return first }
+            if Date() >= deadline { return nil }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
     }
 
     /// On daemon start (i.e. at login), proactively unlock the keychain via the
@@ -136,19 +209,24 @@ extension DaemonCoordinator {
     }
 
     /// Run one unlock handshake with a specific phone, then unlock the keychain.
-    func performKeychainUnlock(centralID: UUID, deviceID: String, reason: String) async {
-        guard let path = keychainStore.keychainPath() else { return }
+    @discardableResult
+    func performKeychainUnlock(centralID: UUID, deviceID: String, reason: String) async -> KeychainUnlockOutcome {
+        guard let path = keychainStore.keychainPath() else { return .notConfigured }
 
         // Skip if already unlocked (cheap, avoids a needless Face ID).
-        if (try? keychainUnlocker.isLocked(path: path)) == false { return }
+        if (try? keychainUnlocker.isLocked(path: path)) == false { return .alreadyUnlocked }
 
         guard let wrapped = keychainStore.wrappedSecret(forDeviceID: deviceID) else {
             logger.warning("Keychain unlock: device \(deviceID) has no wrapped secret — skipping")
-            return
+            await auditLog.log(AuditEntry(sessionID: UUID().uuidString, surface: "keychain_unlock",
+                                          deviceID: deviceID, result: "FAILED_NO_SECRET"))
+            return .failed("no_secret")
         }
         guard let crypto = stateLock.withLock({ sessions[centralID]?.sessionCrypto }) else {
             logger.warning("Keychain unlock: no session crypto for \(centralID) — skipping")
-            return
+            await auditLog.log(AuditEntry(sessionID: UUID().uuidString, surface: "keychain_unlock",
+                                          deviceID: deviceID, result: "FAILED_NO_SESSION"))
+            return .failed("no_session")
         }
 
         let requestID = UUID()
@@ -168,15 +246,20 @@ extension DaemonCoordinator {
             wire = framed
         } catch {
             logger.error("Keychain unlock: failed to build request — \(error.localizedDescription)")
-            return
+            await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
+                                          deviceID: deviceID, result: "FAILED_BUILD"))
+            return .failed("build_error")
         }
 
-        // Await the phone's shared-secret reply, racing a timeout.
+        // Await the phone's shared-secret reply, racing a timeout. `sendFailed`
+        // distinguishes "couldn't even notify the phone" from a genuine timeout.
+        let sendFailed = LockedBox<Bool>(false)
         let sharedSecret: Data? = await withCheckedContinuation { outer in
             let cont = UnlockContinuation(outer)
             stateLock.withLock { pendingUnlocks[requestID] = cont }
 
             guard bleServer.sendChallenge(wire, to: centralID) else {
+                sendFailed.mutate { $0 = true }
                 stateLock.withLock { _ = pendingUnlocks.removeValue(forKey: requestID) }
                 cont.resume(returning: nil)
                 return
@@ -190,10 +273,16 @@ extension DaemonCoordinator {
         stateLock.withLock { _ = pendingUnlocks.removeValue(forKey: requestID) }
 
         guard let sharedSecret else {
+            if sendFailed.value {
+                logger.warning("Keychain unlock: could not send request to \(deviceID)")
+                await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
+                                              deviceID: deviceID, result: "FAILED_SEND"))
+                return .failed("send_failed")
+            }
             logger.warning("Keychain unlock: no response from \(deviceID) (timeout)")
             await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
                                           deviceID: deviceID, result: "FAILED_TIMEOUT"))
-            return
+            return .failed("timeout")
         }
 
         // Unwrap → password → unlock. The plaintext lives only in this scope.
@@ -205,10 +294,12 @@ extension DaemonCoordinator {
             logger.info("Keychain unlocked via \(deviceID)")
             await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
                                           deviceID: deviceID, result: "UNLOCKED"))
+            return .unlocked
         } catch {
             logger.error("Keychain unlock failed: \(error.localizedDescription)")
             await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
                                           deviceID: deviceID, result: "FAILED_UNWRAP"))
+            return .failed("unwrap_failed")
         }
     }
 

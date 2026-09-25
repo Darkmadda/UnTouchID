@@ -88,13 +88,79 @@ struct MenuBarView: View {
                 AppWindows.shared.showSettings(state, tab: .devices)
             }
 
-            MenuRow(title: "Keychain Unlock…", systemImage: "key") {
-                AppWindows.shared.showSettings(state, tab: .keychain)
-            }
+            keychainSection
 
             MenuRow(title: "Settings…", systemImage: "gearshape") {
                 AppWindows.shared.showSettings(state, tab: .general)
             }
+        }
+    }
+
+    // MARK: - Keychain
+
+    /// Live keychain-unlock state: a Locked/Unlocked indicator plus a manual
+    /// "Unlock Keychain Now" button for when a screen unlock didn't carry the
+    /// keychain along. Falls back to a setup entry point when not configured.
+    @ViewBuilder
+    private var keychainSection: some View {
+        let kc = state.keychainUnlock
+        if kc.active {
+            HStack(spacing: 10) {
+                Image(systemName: keychainIcon)
+                    .frame(width: 18)
+                    .foregroundStyle(keychainTint)
+                Text(keychainStatusText)
+                Spacer()
+                if state.isUnlockingKeychain { ProgressView().controlSize(.small) }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 7)
+
+            MenuRow(title: "Unlock Keychain Now", systemImage: "key.fill") {
+                state.unlockKeychainNow()
+            }
+            .disabled(state.isUnlockingKeychain || kc.locked == false)
+
+            if let msg = state.lastKeychainUnlockMessage {
+                Text(msg)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 4)
+            }
+        } else if kc.hasPendingEnrollment {
+            MenuRow(title: "Finish Keychain Setup…", systemImage: "key") {
+                AppWindows.shared.showSettings(state, tab: .keychain)
+            }
+        } else {
+            MenuRow(title: "Set Up Keychain Unlock…", systemImage: "key") {
+                AppWindows.shared.showSettings(state, tab: .keychain)
+            }
+        }
+    }
+
+    private var keychainIcon: String {
+        switch state.keychainUnlock.locked {
+        case .some(true): return "lock.fill"
+        case .some(false): return "lock.open.fill"
+        case .none: return "key"
+        }
+    }
+
+    private var keychainTint: Color {
+        switch state.keychainUnlock.locked {
+        case .some(true): return .orange
+        case .some(false): return .green
+        case .none: return .secondary
+        }
+    }
+
+    private var keychainStatusText: String {
+        if state.isUnlockingKeychain { return "Unlocking keychain…" }
+        switch state.keychainUnlock.locked {
+        case .some(true): return "Keychain locked"
+        case .some(false): return "Keychain unlocked"
+        case .none: return "Keychain status unknown"
         }
     }
 

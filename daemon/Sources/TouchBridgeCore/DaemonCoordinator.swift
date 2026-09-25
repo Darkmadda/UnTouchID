@@ -9,7 +9,7 @@ import TouchBridgeProtocol
 ///
 /// This is the central integration point that wires events from the BLE layer
 /// to the crypto and storage layers.
-public final class DaemonCoordinator: NSObject, PAMAuthHandler, @unchecked Sendable {
+public final class DaemonCoordinator: NSObject, PAMAuthHandler, KeychainUnlockRequesting, @unchecked Sendable {
     let logger = Logger(subsystem: "dev.touchbridge", category: "Coordinator")
 
     // Components

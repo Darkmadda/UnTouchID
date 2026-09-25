@@ -13,6 +13,10 @@ final class MenuBarState: ObservableObject {
     @Published var authCount = 0
     /// True while a start/stop/settings action is in flight.
     @Published var isBusy = false
+    /// True while an on-demand keychain unlock is waiting on the phone.
+    @Published var isUnlockingKeychain = false
+    /// Last on-demand keychain-unlock outcome, shown briefly in the menu.
+    @Published var lastKeychainUnlockMessage: String?
     /// Which Settings tab to show when the window is opened.
     @Published var settingsTab: SettingsTab = .general
 
@@ -73,6 +77,28 @@ final class MenuBarState: ObservableObject {
 
     func toggleDaemon() {
         if isDaemonRunning { stopDaemon() } else { startDaemon() }
+    }
+
+    /// Manually unlock the login keychain via the phone, through the daemon.
+    /// Useful when a screen unlock didn't carry the keychain along.
+    func unlockKeychainNow() {
+        guard !isUnlockingKeychain else { return }
+        isUnlockingKeychain = true
+        lastKeychainUnlockMessage = nil
+        DispatchQueue.global().async {
+            let result = KeychainUnlockStore.requestUnlock()
+            DispatchQueue.main.async {
+                self.isUnlockingKeychain = false
+                self.lastKeychainUnlockMessage = result.message
+                self.refresh()
+                // Clear the transient message after a few seconds.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                    if self.lastKeychainUnlockMessage == result.message {
+                        self.lastKeychainUnlockMessage = nil
+                    }
+                }
+            }
+        }
     }
 
     func unpair(_ device: PairedDeviceInfo) {

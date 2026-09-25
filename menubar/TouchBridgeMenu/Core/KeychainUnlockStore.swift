@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// Read-only view of the opt-in "unlock the login keychain from your phone"
 /// state, mirroring `TouchBridgeCore.KeychainSecretStore`'s on-disk shape in
@@ -17,6 +18,9 @@ enum KeychainUnlockStore {
         var enabled = false
         var keychainPath: String?
         var enrollments: [Enrollment] = []
+        /// Current lock state of the managed login keychain: true = locked,
+        /// false = unlocked, nil = couldn't be determined.
+        var locked: Bool?
 
         struct Enrollment: Identifiable, Equatable {
             let deviceID: String
@@ -55,11 +59,118 @@ enum KeychainUnlockStore {
                 )
             }
             .sorted { $0.enrolledAt < $1.enrolledAt }
+        let path = stored.keychainPath ?? defaultLoginKeychainPath
         return Status(
             enabled: stored.enabled ?? false,
             keychainPath: stored.keychainPath,
-            enrollments: enrollments
+            enrollments: enrollments,
+            locked: isLocked(path: path)
         )
+    }
+
+    /// The current user's default login keychain path.
+    static var defaultLoginKeychainPath: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Keychains/login.keychain-db").path
+    }
+
+    /// Whether the keychain at `path` is locked (nil if it can't be read).
+    ///
+    /// Uses the same deprecated-but-only-way `SecKeychain*` file-keychain APIs the
+    /// daemon uses; reading lock state needs no unlock and no admin rights.
+    @available(macOS, deprecated: 10.10)
+    static func isLocked(path: String) -> Bool? {
+        var keychain: SecKeychain?
+        guard SecKeychainOpen(path, &keychain) == errSecSuccess, let keychain else { return nil }
+        var status: SecKeychainStatus = 0
+        guard SecKeychainGetStatus(keychain, &status) == errSecSuccess else { return nil }
+        // kSecUnlockStateStatus is set when the keychain is unlocked.
+        return (status & UInt32(kSecUnlockStateStatus)) == 0
+    }
+
+    // MARK: - On-demand unlock (daemon socket)
+
+    enum UnlockResult: Equatable {
+        case success
+        case notConfigured
+        case noDeviceConnected
+        case daemonUnreachable
+        case failed(String)
+
+        /// A short, user-facing description of a non-success result.
+        var message: String {
+            switch self {
+            case .success: return "Keychain unlocked"
+            case .notConfigured: return "Keychain unlock isn't set up yet"
+            case .noDeviceConnected: return "No enrolled phone is connected"
+            case .daemonUnreachable: return "The TouchBridge service isn't running"
+            case .failed(let r): return "Unlock failed (\(r))"
+            }
+        }
+    }
+
+    static var socketPath: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/TouchBridge/daemon.sock").path
+    }
+
+    /// Ask the running daemon to unlock the login keychain now: it waits for an
+    /// enrolled phone and triggers a Face ID on it. Blocking — call off the main
+    /// thread. The daemon may take up to ~20s waiting for the phone.
+    static func requestUnlock() -> UnlockResult {
+        let request = #"{"action":"unlock_keychain","user":"","service":"menubar","pid":\#(getpid())}"#
+        guard let reply = sendToDaemon(request) else { return .daemonUnreachable }
+        guard let data = reply.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = obj["result"] as? String else {
+            return .failed("bad_response")
+        }
+        if result == "success" { return .success }
+        let reason = obj["reason"] as? String ?? "unknown"
+        switch reason {
+        case "not_configured": return .notConfigured
+        case "no_device": return .noDeviceConnected
+        default: return .failed(reason)
+        }
+    }
+
+    /// Send one newline-terminated JSON line to the daemon's Unix socket and read
+    /// one line back. Returns nil if the socket can't be reached.
+    private static func sendToDaemon(_ line: String, timeout: TimeInterval = 30) -> String? {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = socketPath.utf8CString
+        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return nil }
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { dest in
+                for i in 0..<pathBytes.count { dest[i] = pathBytes[i] }
+            }
+        }
+
+        let connected = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connected == 0 else { return nil }
+
+        // Bound the wait so the UI can't hang forever if the daemon stalls.
+        var tv = timeval(tv_sec: Int(timeout), tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        let payload = Array((line + "\n").utf8)
+        let sent = payload.withUnsafeBytes { send(fd, $0.baseAddress, $0.count, 0) }
+        guard sent == payload.count else { return nil }
+
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let n = recv(fd, &buffer, buffer.count - 1, 0)
+        guard n > 0 else { return nil }
+        buffer[n] = 0
+        return String(cString: buffer).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Interactive CLI hand-off

@@ -57,6 +57,12 @@ public protocol PAMAuthHandler: AnyObject, Sendable {
     func authenticateFromPAM(user: String, service: String, pid: Int, timeout: TimeInterval) async -> (success: Bool, reason: String?)
 }
 
+/// Handles on-demand keychain-unlock requests (e.g. the menu-bar "Unlock
+/// Keychain Now" button) that arrive over the same socket as PAM auth.
+public protocol KeychainUnlockRequesting: AnyObject, Sendable {
+    func requestKeychainUnlock(reason: String, waitForDevice: TimeInterval) async -> KeychainUnlockOutcome
+}
+
 /// Unix domain socket server for PAM module communication.
 ///
 /// Listens on `~/Library/Application Support/TouchBridge/daemon.sock`.
@@ -66,6 +72,8 @@ public final class SocketServer: @unchecked Sendable {
 
     private let socketPath: String
     private let authHandler: PAMAuthHandler
+    /// Optional on-demand keychain-unlock handler (nil in simulator/web modes).
+    private let keychainHandler: KeychainUnlockRequesting?
     private let policyEngine: PolicyEngine
     /// Reported to the PAM module in every response; see `DaemonMode`.
     public let mode: DaemonMode
@@ -79,11 +87,13 @@ public final class SocketServer: @unchecked Sendable {
 
     public init(
         authHandler: PAMAuthHandler,
+        keychainHandler: KeychainUnlockRequesting? = nil,
         policyEngine: PolicyEngine = PolicyEngine(),
         socketPath: String? = nil,
         mode: DaemonMode = .production
     ) {
         self.authHandler = authHandler
+        self.keychainHandler = keychainHandler
         self.policyEngine = policyEngine
         self.mode = mode
 
@@ -238,6 +248,12 @@ public final class SocketServer: @unchecked Sendable {
             return
         }
 
+        // On-demand keychain unlock (menu-bar button) shares this socket.
+        if request.action == "unlock_keychain" {
+            await handleUnlockKeychain(fd: fd)
+            return
+        }
+
         guard request.action == "authenticate" else {
             sendResponse(fd: fd, response: .failure("unknown_action", mode: mode))
             return
@@ -260,6 +276,33 @@ public final class SocketServer: @unchecked Sendable {
         sendResponse(fd: fd, response: response)
 
         logger.info("PAM auth result: user=\(request.user) service=\(request.service) result=\(response.result) mode=\(self.mode.rawValue)")
+    }
+
+    /// Run an on-demand keychain unlock and report the outcome. Waits for an
+    /// enrolled phone (up to the handler's window) and triggers a Face ID on it.
+    private func handleUnlockKeychain(fd: Int32) async {
+        guard let keychainHandler else {
+            logger.warning("unlock_keychain request but no keychain handler in this mode")
+            sendResponse(fd: fd, response: .failure("keychain_unavailable", mode: mode))
+            return
+        }
+        logger.info("On-demand keychain unlock requested")
+        let outcome = await keychainHandler.requestKeychainUnlock(
+            reason: "unlock your Mac keychain", waitForDevice: 20
+        )
+        let response: PAMResponse
+        switch outcome {
+        case .unlocked, .alreadyUnlocked:
+            response = .success(mode: mode)
+        case .notConfigured:
+            response = .failure("not_configured", mode: mode)
+        case .noDeviceConnected:
+            response = .failure("no_device", mode: mode)
+        case .failed(let reason):
+            response = .failure(reason, mode: mode)
+        }
+        logger.info("On-demand keychain unlock result: \(response.result) (\(response.reason ?? "-"))")
+        sendResponse(fd: fd, response: response)
     }
 
     private func sendResponse(fd: Int32, response: PAMResponse) {

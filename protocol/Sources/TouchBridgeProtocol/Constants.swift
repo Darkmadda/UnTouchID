@@ -36,6 +36,14 @@ public enum TouchBridgeConstants {
     /// Default companion response timeout in seconds.
     public static let responseTimeoutSeconds: TimeInterval = 15.0
 
+    /// Timeout for the keychain-unlock handshake. Much longer than a normal
+    /// challenge response because it's a *deliberate second biometric*: the user
+    /// has to notice the prompt, pick up the phone, authenticate, and the phone
+    /// then runs a StrongBox/Secure-Enclave ECDH (slow on some devices) before
+    /// replying. 15s routinely isn't enough and the reply lands after the daemon
+    /// has stopped listening.
+    public static let keychainUnlockTimeoutSeconds: TimeInterval = 60.0
+
     /// Default RSSI proximity threshold (dBm).
     public static let defaultRSSIThreshold: Int = -75
 

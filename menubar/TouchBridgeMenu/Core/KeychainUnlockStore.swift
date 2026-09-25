@@ -136,7 +136,11 @@ enum KeychainUnlockStore {
 
     /// Send one newline-terminated JSON line to the daemon's Unix socket and read
     /// one line back. Returns nil if the socket can't be reached.
-    private static func sendToDaemon(_ line: String, timeout: TimeInterval = 30) -> String? {
+    ///
+    /// The read timeout must exceed the daemon's worst case: it waits for the
+    /// phone to be reachable and then runs the unlock handshake, which is a
+    /// deliberate second biometric plus a slow StrongBox/Secure-Enclave ECDH.
+    private static func sendToDaemon(_ line: String, timeout: TimeInterval = 95) -> String? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }

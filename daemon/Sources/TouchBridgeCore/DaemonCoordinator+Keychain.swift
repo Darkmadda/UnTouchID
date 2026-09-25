@@ -266,7 +266,7 @@ extension DaemonCoordinator {
             }
 
             Task {
-                try? await Task.sleep(nanoseconds: UInt64(TouchBridgeConstants.responseTimeoutSeconds * 1_000_000_000))
+                try? await Task.sleep(nanoseconds: UInt64(TouchBridgeConstants.keychainUnlockTimeoutSeconds * 1_000_000_000))
                 cont.resume(returning: nil)
             }
         }

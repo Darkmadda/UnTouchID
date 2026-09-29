@@ -32,6 +32,18 @@ changes the security model — read "Security & tradeoffs" before enabling it.**
   seconds) for the phone — or any enrolled phone — to be reachable rather than
   firing once and giving up. Every attempt is recorded in the audit log.
 
+### One prompt, not two (Android)
+
+When the keychain request arrives within **10 s** of the phone approving a
+screen unlock from the same Mac, the Android companion answers it without a
+second biometric prompt. This is enforced by Android Keystore, not just the app:
+the keychain key is bound to a recent strong biometric (30 s validity), so the
+silent ECDH only succeeds if that approval's Face/fingerprint check is still
+fresh — otherwise it falls back to the normal prompt. Each approval covers one
+unlock. Requests outside the window (menu-bar **Unlock Keychain Now**, startup
+unlock, a keychain that locks later) always prompt. Tunable via
+`KEYCHAIN_SILENT_GRACE_MS` in `Constants.kt`. (iOS companion: unchanged.)
+
 ## Manual unlock (menu bar)
 
 The keychain doesn't always unlock automatically — the phone may be out of range,
@@ -51,7 +63,33 @@ tail -f "$HOME/Library/Logs/TouchBridge/touchbridge-$(date +%F).ndjson" | grep k
 phone was reachable in the wait window), `FAILED_SEND` (couldn't notify the
 phone), `FAILED_TIMEOUT` (phone didn't answer — often the second Face ID prompt
 was missed), `FAILED_NO_SESSION` / `FAILED_NO_SECRET` / `FAILED_UNWRAP`
-(handshake/state problems).
+(handshake/state problems), `FAILED_WRONG_PASSWORD` (the phone's copy decrypted
+fine but the keychain rejected it — its password was changed outside
+TouchBridge; re-run `keychain-setup`), `FAILED_RELOCK` / `FAILED_VERIFY`
+(couldn't repair a stale keychain, see below), `LOCKED_AFTER_AUTH` (the
+keychain was usable when the screen unlock was approved but macOS locked it
+moments later — the daemon watches for 20 s after a screen unlock and then
+unlocks it; `latency_ms` is how long after approval), `SKIPPED_UNLOCKED` (it
+stayed usable the whole window, nothing to do).
+
+### "Unlocked" but apps can't read or save passwords (stale keychain)
+
+securityd can report the login keychain as unlocked while the key it has cached
+no longer decrypts the file (for example after the file was re-keyed or replaced
+while it was unlocked). Every read/write then fails with *"The user name or
+passphrase you entered is not correct"*, and apps like MySQL Workbench or the
+Claude CLI can't load or save credentials.
+
+The daemon and menu bar don't trust the "unlocked" flag alone: they confirm it
+with a harmless settings read. When that fails, the menu bar shows **Keychain
+needs unlock**, the next screen unlock (or **Unlock Keychain Now**) logs
+`STALE_DETECTED`, re-locks the keychain to drop the stale key, and unlocks it
+again with the phone. Manual equivalent:
+
+```bash
+security lock-keychain ~/Library/Keychains/login.keychain-db
+# then "Unlock Keychain Now" in the menu bar
+```
 
 ## Enable it
 

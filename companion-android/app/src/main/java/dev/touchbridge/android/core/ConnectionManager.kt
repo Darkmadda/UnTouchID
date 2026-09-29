@@ -4,6 +4,8 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.security.keystore.UserNotAuthenticatedException
 import android.util.Base64
 import android.util.Log
 import dev.touchbridge.android.Constants
@@ -94,6 +96,14 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
     }
     /** The pairing ceremony in progress, if any. Guarded by [lock]. */
     private var pendingPairing: PendingPairing? = null
+
+    /**
+     * macId → elapsedRealtime() of the last challenge this phone approved for
+     * that Mac. A keychain-unlock request from the same Mac shortly afterwards
+     * (the Mac asks right after a screen unlock) is answered without a second
+     * prompt — see [trySilentKeychainUnlock]. One approval covers one unlock.
+     */
+    private val recentApprovals = HashMap<String, Long>()
 
     private val deviceID: String =
         prefs.getString(Constants.PREF_DEVICE_ID, null) ?: UUID.randomUUID().toString().also {
@@ -330,6 +340,9 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
         val wire = challengeHandler.buildResponseWire(challengeID, signature, deviceID)
         val sent = bleClient.sendResponse(challenge.macId, wire)
         Log.i(TAG, "Challenge $challengeID response to ${challenge.macName} sent=$sent")
+        if (sent) {
+            synchronized(lock) { recentApprovals[challenge.macId] = SystemClock.elapsedRealtime() }
+        }
         publish {
             it.copy(
                 pendingChallenge = null,
@@ -425,10 +438,44 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
                 reason = json.optString("reason", "unlock your Mac keychain"),
             )
             Log.i(TAG, "Keychain unlock request ${unlock.requestID} from ${unlock.macName}")
+            if (trySilentKeychainUnlock(unlock)) return
             publish { it.copy(pendingUnlock = unlock) }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to parse keychain unlock request", e)
         }
+    }
+
+    /**
+     * Answer a keychain-unlock request without a second prompt when it follows
+     * an approval this phone just gave the same Mac (within
+     * [Constants.KEYCHAIN_SILENT_GRACE_MS]).
+     *
+     * The app-side window is only a policy gate; the actual authorisation is the
+     * Keystore's: the key-agreement key is time-bound to a recent strong
+     * biometric ([KeystoreManager.KEYCHAIN_AUTH_VALIDITY_SECONDS]), so if the
+     * Keystore doesn't consider the approval's biometric fresh, ECDH throws
+     * [UserNotAuthenticatedException] and we fall back to the normal prompt.
+     * The grace is consumed on first use, so one approval covers one unlock.
+     */
+    private fun trySilentKeychainUnlock(unlock: PendingUnlock): Boolean {
+        val approvedAt = synchronized(lock) { recentApprovals.remove(unlock.macId) } ?: return false
+        val ageMs = SystemClock.elapsedRealtime() - approvedAt
+        if (ageMs > Constants.KEYCHAIN_SILENT_GRACE_MS) {
+            Log.i(TAG, "Keychain unlock ${unlock.requestID}: last approval ${ageMs}ms ago — prompting")
+            return false
+        }
+        val shared = try {
+            keystoreManager.computeSharedSecret(Constants.KEYCHAIN_UNLOCK_KEY_ALIAS, unlock.ephemeralPublicKey)
+        } catch (e: UserNotAuthenticatedException) {
+            Log.i(TAG, "Keychain unlock ${unlock.requestID}: Keystore wants a fresh biometric — prompting")
+            return false
+        } catch (e: Exception) {
+            Log.w(TAG, "Keychain unlock ${unlock.requestID}: silent key agreement failed — prompting", e)
+            return false
+        }
+        Log.i(TAG, "Keychain unlock ${unlock.requestID}: covered by approval ${ageMs}ms ago — no second prompt")
+        sendKeychainUnlockResponse(unlock, shared)
+        return true
     }
 
     /**
@@ -441,6 +488,12 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
             Log.w(TAG, "Keychain unlock $requestID no longer pending — dropping")
             return
         }
+        sendKeychainUnlockResponse(unlock, sharedSecret)
+        publish { it.copy(pendingUnlock = null) }
+    }
+
+    private fun sendKeychainUnlockResponse(unlock: PendingUnlock, sharedSecret: ByteArray) {
+        val requestID = unlock.requestID
         try {
             val payload = JSONObject()
                 .put("requestID", requestID)
@@ -453,7 +506,6 @@ class ConnectionManager(context: Context) : BLEClient.Listener {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to send keychain unlock response", e)
         }
-        publish { it.copy(pendingUnlock = null) }
     }
 
     /** Biometric denied/cancelled/failed — drop the unlock request. */

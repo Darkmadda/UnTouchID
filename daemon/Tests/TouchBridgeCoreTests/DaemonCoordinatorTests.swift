@@ -1194,6 +1194,87 @@ private func lastUnlockRequest(_ bleServer: MockBLEServer) -> (data: Data, centr
     #expect(unlocker.isLockedNow == false)
 }
 
+@Test func keychainUnlockRepairsStaleKeychain() async throws {
+    let (coordinator, bleServer, deviceStore, keychainStore, unlocker) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    let randomPW = "stale-repair-pw"
+    let wrapped = try KeychainSecretCrypto.wrap(
+        secret: Data(randomPW.utf8), recipientPublicKey: companion.keychainUnlockPublicKeyData())
+    try keychainStore.setWrappedSecret(
+        forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
+
+    // securityd says "unlocked" but the cached key is stale.
+    unlocker.setLocked(false)
+    unlocker.setStale(true)
+
+    async let done: KeychainUnlockOutcome = coordinator.performKeychainUnlock(
+        centralID: companion.centralID, deviceID: companion.deviceID, reason: "test")
+
+    try await Task.sleep(nanoseconds: 150_000_000)
+    guard let req = lastUnlockRequest(bleServer) else {
+        Issue.record("Stale keychain did not trigger an unlock request"); return
+    }
+    bleServer.simulateResponse(try companion.respondToKeychainUnlockRequest(req.data), from: companion.centralID)
+
+    #expect(await done == .unlocked)
+    #expect(unlocker.lockCalls == 1)            // re-locked to drop the stale key
+    #expect(unlocker.unlockedWith == [randomPW])
+    #expect(try unlocker.lockState(path: "") == .unlocked)
+}
+
+@Test func onDemandUnlockProceedsWhenStale() async throws {
+    let (coordinator, bleServer, deviceStore, keychainStore, unlocker) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    let wrapped = try KeychainSecretCrypto.wrap(
+        secret: Data("pw".utf8), recipientPublicKey: companion.keychainUnlockPublicKeyData())
+    try keychainStore.setWrappedSecret(
+        forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
+    unlocker.setLocked(false)
+    unlocker.setStale(true)
+
+    async let outcome: KeychainUnlockOutcome =
+        coordinator.requestKeychainUnlock(reason: "manual", waitForDevice: 3)
+
+    try await Task.sleep(nanoseconds: 200_000_000)
+    guard let req = lastUnlockRequest(bleServer) else {
+        Issue.record("On-demand unlock treated a stale keychain as unlocked"); return
+    }
+    bleServer.simulateResponse(try companion.respondToKeychainUnlockRequest(req.data), from: companion.centralID)
+    #expect(await outcome == .unlocked)
+}
+
+@Test func keychainUnlockReportsWrongPassword() async throws {
+    let (coordinator, bleServer, deviceStore, keychainStore, unlocker) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    let wrapped = try KeychainSecretCrypto.wrap(
+        secret: Data("pw".utf8), recipientPublicKey: companion.keychainUnlockPublicKeyData())
+    try keychainStore.setWrappedSecret(
+        forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
+    unlocker.failUnlock = true  // keychain password changed outside TouchBridge
+
+    async let done: KeychainUnlockOutcome = coordinator.performKeychainUnlock(
+        centralID: companion.centralID, deviceID: companion.deviceID, reason: "test")
+
+    try await Task.sleep(nanoseconds: 150_000_000)
+    guard let req = lastUnlockRequest(bleServer) else {
+        Issue.record("No keychain unlock request sent"); return
+    }
+    bleServer.simulateResponse(try companion.respondToKeychainUnlockRequest(req.data), from: companion.centralID)
+    #expect(await done == .failed("wrong_password"))
+}
+
 @Test func keychainUnlockSkipsWhenAlreadyUnlocked() async throws {
     let (coordinator, bleServer, deviceStore, keychainStore, unlocker) = makeKeychainCoordinator()
     let companion = CompanionSimulator()
@@ -1258,6 +1339,46 @@ private func lastUnlockRequest(_ bleServer: MockBLEServer) -> (data: Data, centr
     try await Task.sleep(nanoseconds: 200_000_000)
     guard let req = lastUnlockRequest(bleServer) else {
         Issue.record("Auth success did not trigger a keychain unlock request"); return
+    }
+    bleServer.simulateResponse(try companion.respondToKeychainUnlockRequest(req.data), from: companion.centralID)
+    try await Task.sleep(nanoseconds: 200_000_000)
+
+    #expect(unlocker.unlockedWith == [randomPW])
+    #expect(unlocker.isLockedNow == false)
+}
+
+@Test func keychainLockedShortlyAfterScreenUnlockIsStillUnlocked() async throws {
+    let (coordinator, bleServer, deviceStore, keychainStore, unlocker) = makeKeychainCoordinator()
+    let companion = CompanionSimulator()
+    try register(companion, in: deviceStore)
+    try await fullyConnect(companion: companion, to: coordinator, via: bleServer)
+    try await enroll(companion, to: coordinator, via: bleServer)
+
+    let randomPW = "late-lock-pw"
+    let wrapped = try KeychainSecretCrypto.wrap(
+        secret: Data(randomPW.utf8), recipientPublicKey: companion.keychainUnlockPublicKeyData())
+    try keychainStore.setWrappedSecret(
+        forDeviceID: companion.deviceID, wrapped: wrapped, keychainPath: "/tmp/login.keychain-db")
+
+    // Keychain is unlocked when the screen-unlock auth is approved…
+    unlocker.setLocked(false)
+    async let auth = coordinator.authenticateFromPAM(
+        user: "u", service: "screensaver_new", pid: 1, timeout: 5.0)
+    try await Task.sleep(nanoseconds: 150_000_000)
+    guard let challenge = bleServer.sentChallenges.first(where: {
+        $0.data.count > 1 && $0.data[$0.data.startIndex + 1] == MessageType.challengeIssued.rawValue
+    }) else { Issue.record("No challenge sent"); return }
+    bleServer.simulateResponse(try companion.respondToChallenge(challenge.data), from: companion.centralID)
+    #expect(await auth.success == true)
+
+    // …and macOS locks it a moment later.
+    try await Task.sleep(nanoseconds: 1_000_000_000)
+    #expect(lastUnlockRequest(bleServer) == nil)
+    unlocker.setLocked(true)
+
+    try await Task.sleep(nanoseconds: 1_500_000_000)
+    guard let req = lastUnlockRequest(bleServer) else {
+        Issue.record("Late keychain lock after screen unlock was not picked up"); return
     }
     bleServer.simulateResponse(try companion.respondToKeychainUnlockRequest(req.data), from: companion.centralID)
     try await Task.sleep(nanoseconds: 200_000_000)

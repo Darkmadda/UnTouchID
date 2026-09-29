@@ -157,6 +157,7 @@ struct MenuBarView: View {
 
     private var keychainStatusText: String {
         if state.isUnlockingKeychain { return "Unlocking keychain…" }
+        if state.keychainUnlock.stale { return "Keychain needs unlock" }
         switch state.keychainUnlock.locked {
         case .some(true): return "Keychain locked"
         case .some(false): return "Keychain unlocked"

@@ -17,7 +17,7 @@ func makeTempKeychainStore() -> KeychainSecretStore {
 
 /// In-memory `KeychainUnlocking` so coordinator tests never touch a real keychain.
 final class MockKeychainUnlocker: KeychainUnlocking, @unchecked Sendable {
-    private let lock = NSLock()
+    private let mu = NSLock()
     private var _locked: Bool
     /// Passwords passed to `unlock`, in order.
     private(set) var unlockedWith: [String] = []
@@ -25,21 +25,35 @@ final class MockKeychainUnlocker: KeychainUnlocking, @unchecked Sendable {
     private(set) var changeCalls: [(old: String, new: String)] = []
     /// When true, `unlock` throws instead of succeeding.
     var failUnlock = false
+    /// "Unlocked" per securityd, but the cached key can't decrypt the file.
+    private var _stale = false
+    /// Number of `lock` calls.
+    private(set) var lockCalls = 0
 
     init(locked: Bool = true) { _locked = locked }
 
-    var isLockedNow: Bool { lock.withLock { _locked } }
+    var isLockedNow: Bool { mu.withLock { _locked } }
 
-    func setLocked(_ value: Bool) { lock.withLock { _locked = value } }
+    func setLocked(_ value: Bool) { mu.withLock { _locked = value } }
 
-    func isLocked(path: String) throws -> Bool { lock.withLock { _locked } }
+    func setStale(_ value: Bool) { mu.withLock { _stale = value } }
+
+    func isLocked(path: String) throws -> Bool { mu.withLock { _locked } }
+
+    func lockState(path: String) throws -> KeychainLockState {
+        mu.withLock { _locked ? .locked : (_stale ? .stale : .unlocked) }
+    }
+
+    func lock(path: String) throws {
+        mu.withLock { _locked = true; _stale = false; lockCalls += 1 }
+    }
 
     func unlock(path: String, password: String) throws {
         if failUnlock { throw KeychainUnlockerError.unlockFailed(-1) }
-        lock.withLock { _locked = false; unlockedWith.append(password) }
+        mu.withLock { _locked = false; unlockedWith.append(password) }
     }
 
     func changePassword(path: String, oldPassword: String, newPassword: String) throws {
-        lock.withLock { changeCalls.append((oldPassword, newPassword)); _locked = false }
+        mu.withLock { changeCalls.append((oldPassword, newPassword)); _locked = false }
     }
 }

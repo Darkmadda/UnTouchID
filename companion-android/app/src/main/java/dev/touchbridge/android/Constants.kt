@@ -22,6 +22,14 @@ object Constants {
     const val MSG_TYPE_KEYCHAIN_UNLOCK_REQUEST: Byte = 8
     const val MSG_TYPE_KEYCHAIN_UNLOCK_RESPONSE: Byte = 9
 
+    // A keychain-unlock request arriving within this long of approving a
+    // challenge from the same Mac (i.e. right after a screen unlock) is answered
+    // without a second biometric prompt. Must stay below
+    // KeystoreManager.KEYCHAIN_AUTH_VALIDITY_SECONDS, which the Keystore enforces.
+    // 10 s rather than 5 s: the Mac's request can trail the approval by a few
+    // seconds while the BLE link re-establishes after the screen unlocks.
+    const val KEYCHAIN_SILENT_GRACE_MS = 10_000L
+
     // Well-known error code: signing key invalidated (biometric enrollment changed)
     const val ERROR_CODE_KEY_INVALIDATED = 1001
 

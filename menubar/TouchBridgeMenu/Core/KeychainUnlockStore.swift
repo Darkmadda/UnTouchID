@@ -19,8 +19,13 @@ enum KeychainUnlockStore {
         var keychainPath: String?
         var enrollments: [Enrollment] = []
         /// Current lock state of the managed login keychain: true = locked,
-        /// false = unlocked, nil = couldn't be determined.
+        /// false = unlocked, nil = couldn't be determined. A stale keychain
+        /// (see `stale`) counts as locked, since nothing can use it.
         var locked: Bool?
+        /// securityd reports the keychain unlocked, but its cached key no longer
+        /// decrypts the file — apps can't read or save passwords until it is
+        /// re-locked and unlocked (the daemon does this on "Unlock Keychain Now").
+        var stale = false
 
         struct Enrollment: Identifiable, Equatable {
             let deviceID: String
@@ -60,11 +65,14 @@ enum KeychainUnlockStore {
             }
             .sorted { $0.enrolledAt < $1.enrolledAt }
         let path = stored.keychainPath ?? defaultLoginKeychainPath
+        let locked = isLocked(path: path)
+        let stale = locked == false && isStale(path: path)
         return Status(
             enabled: stored.enabled ?? false,
             keychainPath: stored.keychainPath,
             enrollments: enrollments,
-            locked: isLocked(path: path)
+            locked: stale ? true : locked,
+            stale: stale
         )
     }
 
@@ -86,6 +94,24 @@ enum KeychainUnlockStore {
         guard SecKeychainGetStatus(keychain, &status) == errSecSuccess else { return nil }
         // kSecUnlockStateStatus is set when the keychain is unlocked.
         return (status & UInt32(kSecUnlockStateStatus)) == 0
+    }
+
+    /// True when the keychain reports unlocked but can't actually be used.
+    /// `SecKeychainGetStatus` only reflects securityd's cached flag;
+    /// `SecKeychainCopySettings` needs the real key and fails with
+    /// errSecAuthFailed when that key is stale. Interaction is disabled so the
+    /// probe can never show a password dialog. Mirrors the daemon's check.
+    @available(macOS, deprecated: 10.10)
+    static func isStale(path: String) -> Bool {
+        var keychain: SecKeychain?
+        guard SecKeychainOpen(path, &keychain) == errSecSuccess, let keychain else { return false }
+        var wasAllowed: DarwinBoolean = true
+        SecKeychainGetUserInteractionAllowed(&wasAllowed)
+        SecKeychainSetUserInteractionAllowed(false)
+        defer { SecKeychainSetUserInteractionAllowed(wasAllowed.boolValue) }
+        var settings = SecKeychainSettings()
+        settings.version = 1 // SEC_KEYCHAIN_SETTINGS_VERS1
+        return SecKeychainCopySettings(keychain, &settings) == errSecAuthFailed
     }
 
     // MARK: - On-demand unlock (daemon socket)

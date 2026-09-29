@@ -108,8 +108,26 @@ extension DaemonCoordinator {
     func unlockKeychainAfterAuth(service: String, winner: AuthWinner) async {
         guard Self.keychainUnlockServices.contains(service) else { return }
         guard keychainStore.isActive(), let path = keychainStore.keychainPath() else { return }
-        // Already unlocked (the common case while actively using the Mac) — silent no-op.
-        if (try? keychainUnlocker.isLocked(path: path)) == false { return }
+        // PAM returns before macOS has finished the screen-unlock authorization,
+        // and the rest of that flow can lock the login keychain a moment *after*
+        // our module approved (observed on macOS 26: unlocked at approval time,
+        // locked seconds later, so a single check here skipped the unlock). So
+        // if it's usable right now, keep watching for a short window instead of
+        // giving up. A stale "unlocked" keychain counts as needing unlock.
+        if keychainState(path: path) == .unlocked {
+            let started = Date()
+            guard await waitForKeychainToNeedUnlock(path: path, window: Self.postAuthKeychainWatchSeconds) else {
+                logger.info("Keychain stayed unlocked after \(service) auth — nothing to do")
+                await auditLog.log(AuditEntry(sessionID: UUID().uuidString, surface: "keychain_unlock",
+                                              deviceID: winner.deviceID, result: "SKIPPED_UNLOCKED"))
+                return
+            }
+            let delayMs = Int(Date().timeIntervalSince(started) * 1000)
+            logger.info("Keychain locked \(delayMs)ms after \(service) auth — unlocking via phone")
+            await auditLog.log(AuditEntry(sessionID: UUID().uuidString, surface: "keychain_unlock",
+                                          deviceID: winner.deviceID, result: "LOCKED_AFTER_AUTH",
+                                          latencyMs: delayMs))
+        }
 
         guard let target = await waitForEnrolledTarget(preferred: winner.centralID, timeout: 8) else {
             logger.warning("Keychain unlock after auth: no enrolled phone reachable (winner \(winner.deviceID))")
@@ -130,7 +148,7 @@ extension DaemonCoordinator {
         guard keychainStore.isActive(), let path = keychainStore.keychainPath() else {
             return .notConfigured
         }
-        if (try? keychainUnlocker.isLocked(path: path)) == false {
+        if keychainState(path: path) == .unlocked {
             return .alreadyUnlocked
         }
         guard let target = await waitForEnrolledTarget(preferred: nil, timeout: waitForDevice) else {
@@ -142,6 +160,20 @@ extension DaemonCoordinator {
         return await performKeychainUnlock(centralID: target.centralID,
                                            deviceID: target.deviceID,
                                            reason: reason)
+    }
+
+    /// How long to keep watching the keychain after a session-unlock auth.
+    static let postAuthKeychainWatchSeconds: TimeInterval = 20
+
+    /// Poll the keychain state for up to `window` seconds. Returns true as soon
+    /// as it is locked, stale, or unreadable; false if it stayed usable.
+    func waitForKeychainToNeedUnlock(path: String, window: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(window)
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            if keychainState(path: path) != .unlocked { return true }
+        }
+        return false
     }
 
     /// Poll for a connected, identified phone that has a wrapped secret ready, up
@@ -177,7 +209,7 @@ extension DaemonCoordinator {
             let deadline = Date().addingTimeInterval(timeout)
             // Only bother if the keychain is actually locked.
             if let path = self.keychainStore.keychainPath(),
-               (try? self.keychainUnlocker.isLocked(path: path)) == false {
+               self.keychainState(path: path) == .unlocked {
                 return
             }
             while Date() < deadline {
@@ -213,8 +245,14 @@ extension DaemonCoordinator {
     func performKeychainUnlock(centralID: UUID, deviceID: String, reason: String) async -> KeychainUnlockOutcome {
         guard let path = keychainStore.keychainPath() else { return .notConfigured }
 
-        // Skip if already unlocked (cheap, avoids a needless Face ID).
-        if (try? keychainUnlocker.isLocked(path: path)) == false { return .alreadyUnlocked }
+        // Skip if already unlocked and usable (cheap, avoids a needless Face ID).
+        let initialState = keychainState(path: path)
+        if initialState == .unlocked { return .alreadyUnlocked }
+        if initialState == .stale {
+            logger.warning("Keychain reports unlocked but is unusable (stale key) — will re-lock and unlock")
+            await auditLog.log(AuditEntry(sessionID: UUID().uuidString, surface: "keychain_unlock",
+                                          deviceID: deviceID, result: "STALE_DETECTED"))
+        }
 
         guard let wrapped = keychainStore.wrappedSecret(forDeviceID: deviceID) else {
             logger.warning("Keychain unlock: device \(deviceID) has no wrapped secret — skipping")
@@ -286,21 +324,62 @@ extension DaemonCoordinator {
         }
 
         // Unwrap → password → unlock. The plaintext lives only in this scope.
+        var password: Data
         do {
-            var password = try KeychainSecretCrypto.unwrap(wrapped, rawSharedSecret: sharedSecret)
-            defer { for i in password.indices { password[i] = 0 } }
-            let pwString = String(decoding: password, as: UTF8.self)
-            try keychainUnlocker.unlock(path: path, password: pwString)
-            logger.info("Keychain unlocked via \(deviceID)")
-            await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
-                                          deviceID: deviceID, result: "UNLOCKED"))
-            return .unlocked
+            password = try KeychainSecretCrypto.unwrap(wrapped, rawSharedSecret: sharedSecret)
         } catch {
-            logger.error("Keychain unlock failed: \(error.localizedDescription)")
+            logger.error("Keychain unlock: unwrap failed — \(error.localizedDescription)")
             await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
                                           deviceID: deviceID, result: "FAILED_UNWRAP"))
             return .failed("unwrap_failed")
         }
+        defer { for i in password.indices { password[i] = 0 } }
+
+        // A stale keychain is "unlocked" already, so SecKeychainUnlock would be a
+        // no-op that leaves the bad cached key in place. Lock it first so the
+        // unlock re-derives the key from the file. Re-check now: the state may
+        // have changed while the phone was prompting.
+        if keychainState(path: path) == .stale {
+            do {
+                try keychainUnlocker.lock(path: path)
+            } catch {
+                logger.error("Keychain unlock: could not re-lock stale keychain — \(error.localizedDescription)")
+                await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
+                                              deviceID: deviceID, result: "FAILED_RELOCK"))
+                return .failed("relock_failed")
+            }
+        }
+
+        do {
+            let pwString = String(decoding: password, as: UTF8.self)
+            try keychainUnlocker.unlock(path: path, password: pwString)
+        } catch {
+            // The wrapped password was decrypted fine but the keychain rejected
+            // it: the keychain's password was changed outside TouchBridge (e.g.
+            // macOS re-synced it to the login password). Re-run keychain-setup.
+            logger.error("Keychain unlock: keychain rejected the stored password — \(error.localizedDescription)")
+            await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
+                                          deviceID: deviceID, result: "FAILED_WRONG_PASSWORD"))
+            return .failed("wrong_password")
+        }
+
+        // Only report success if the keychain is actually usable now.
+        if let after = keychainState(path: path), after != .unlocked {
+            logger.error("Keychain unlock: still unusable after unlock")
+            await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
+                                          deviceID: deviceID, result: "FAILED_VERIFY"))
+            return .failed("verify_failed")
+        }
+        logger.info("Keychain unlocked via \(deviceID)")
+        await auditLog.log(AuditEntry(sessionID: requestID.uuidString, surface: "keychain_unlock",
+                                      deviceID: deviceID, result: "UNLOCKED"))
+        return .unlocked
+    }
+
+    /// Usable lock state of the managed keychain, or nil if it can't be read
+    /// (callers then proceed as if it needs unlocking).
+    func keychainState(path: String) -> KeychainLockState? {
+        try? keychainUnlocker.lockState(path: path)
     }
 
     /// Handle a `keychainUnlockResponse`: decrypt and resume the waiting handshake.

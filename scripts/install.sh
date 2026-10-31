@@ -201,6 +201,60 @@ tb_enable_sudo "prompt"
 tb_enable_screensaver "prompt"
 tb_enable_gui_admin "prompt"
 
+# --- Install PAM self-heal LaunchDaemon ---
+# macOS updates rewrite /etc/pam.d/ to stock, wiping the screensaver and GUI
+# admin hooks (sudo survives via sudo_local). A root LaunchDaemon re-applies
+# them at boot and whenever /etc/pam.d changes, so updates self-heal.
+#
+# It runs as root, so its script and the pam-common.sh it sources must live in a
+# root-owned, non-user-writable dir — NOT the user's checkout. Install copies.
+
+HEAL_LIBEXEC="/usr/local/libexec/touchbridge"
+HEAL_SCRIPT="$HEAL_LIBEXEC/pam-heal.sh"
+HEAL_LABEL="dev.touchbridge.pam-heal"
+HEAL_PLIST="/Library/LaunchDaemons/$HEAL_LABEL.plist"
+HEAL_LOG="/var/log/touchbridge-pam-heal.log"
+
+info "Installing PAM self-heal LaunchDaemon..."
+mkdir -p "$HEAL_LIBEXEC"
+install_fresh "$SCRIPT_DIR/pam-heal.sh"   "$HEAL_SCRIPT"
+install_fresh "$SCRIPT_DIR/pam-common.sh" "$HEAL_LIBEXEC/pam-common.sh"
+chown -R root:wheel "$HEAL_LIBEXEC"
+chmod 755 "$HEAL_LIBEXEC" "$HEAL_SCRIPT"
+chmod 644 "$HEAL_LIBEXEC/pam-common.sh"
+
+launchctl bootout system/"$HEAL_LABEL" 2>/dev/null || true
+cat > "$HEAL_PLIST" << HEALPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$HEAL_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HEAL_SCRIPT</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>WatchPaths</key>
+    <array>
+        <string>/etc/pam.d</string>
+    </array>
+    <key>StandardOutPath</key>
+    <string>$HEAL_LOG</string>
+    <key>StandardErrorPath</key>
+    <string>$HEAL_LOG</string>
+</dict>
+</plist>
+HEALPLIST
+chown root:wheel "$HEAL_PLIST"
+chmod 644 "$HEAL_PLIST"
+launchctl bootstrap system "$HEAL_PLIST" 2>/dev/null || true
+info "PAM self-heal installed (re-applies hooks on boot and when /etc/pam.d changes)."
+info "  Log: $HEAL_LOG"
+
 # --- Install LaunchAgent ---
 
 info "Installing LaunchAgent..."

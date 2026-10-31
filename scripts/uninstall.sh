@@ -98,6 +98,20 @@ if [ -d "$MENU_APP_DST" ]; then
     info "Removed $MENU_APP_DST"
 fi
 
+# --- Remove PAM self-heal LaunchDaemon ---
+# MUST come before stripping the hooks below: its WatchPaths trigger would
+# otherwise re-add them the moment tb_disable_* edits /etc/pam.d, undoing this.
+
+HEAL_LABEL="dev.touchbridge.pam-heal"
+HEAL_PLIST="/Library/LaunchDaemons/$HEAL_LABEL.plist"
+HEAL_LIBEXEC="/usr/local/libexec/touchbridge"
+
+info "Removing PAM self-heal LaunchDaemon..."
+launchctl bootout system/"$HEAL_LABEL" 2>/dev/null || true
+rm -f "$HEAL_PLIST"
+rm -rf "$HEAL_LIBEXEC"
+info "Removed PAM self-heal."
+
 # --- Remove PAM hook (BEFORE the module, to avoid a dangling reference) ---
 
 tb_disable_sudo
